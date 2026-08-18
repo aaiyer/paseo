@@ -3012,11 +3012,12 @@ export class DaemonClient {
     return payload;
   }
 
-  async cancelAgent(agentId: string): Promise<void> {
+  async cancelAgent(agentId: string, turnId?: string): Promise<void> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "cancel_agent_request",
       agentId,
+      ...(turnId ? { turnId } : {}),
       requestId,
     });
     const payload = await this.sendRequest({

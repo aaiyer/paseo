@@ -1753,6 +1753,9 @@ function ComposerContentImpl({
     const cancellation = cancelComposerAgent({
       client,
       agentId: targetAgentId,
+      turnId:
+        useSessionStore.getState().sessions[serverId]?.agents.get(targetAgentId)?.activeTurn
+          ?.turnId ?? undefined,
       isAgentRunning,
       isCancellingAgent,
       isConnected,

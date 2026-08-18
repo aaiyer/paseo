@@ -107,7 +107,6 @@ export function evaluateMayaRestrictedSessionMessage(
     case "wait_for_finish_request":
     case "list_available_providers_request":
     case "provider.usage.list.request":
-    case "cancel_agent_request":
     case "fetch_agent_timeline_request":
     case "agent.timeline.list_prompts.request":
     case "agent.timeline.set_subscription.request":
@@ -117,6 +116,11 @@ export function evaluateMayaRestrictedSessionMessage(
     case "clear_agent_attention":
     case "ping":
       return ALLOWED;
+
+    case "cancel_agent_request":
+      return message.turnId?.trim()
+        ? ALLOWED
+        : denied("cancellation requires the active nonempty turn id");
 
     case "close_items_request":
       return message.terminalIds.length === 0

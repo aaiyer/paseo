@@ -150,6 +150,39 @@ test("cancel_agent_request reports refusal only through its response", async () 
   ]);
 });
 
+test("cancel_agent_request binds cancellation to the selected active turn", async () => {
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const cancelAgentRun = vi.fn(async () => ({ status: "settled" as const }));
+  const session = createSessionForTest({
+    agentManager: {
+      getAgent: vi.fn(() => ({
+        id: agentId,
+        provider: "codex",
+        lifecycle: "running",
+        activeTurnId: "turn-current",
+      })),
+      hasInFlightRun: vi.fn(() => true),
+      cancelAgentRun,
+    },
+  });
+
+  await session.handleMessage({
+    type: "cancel_agent_request",
+    agentId,
+    turnId: "turn-current",
+    requestId: "cancel-current",
+  });
+  expect(cancelAgentRun).toHaveBeenCalledTimes(1);
+
+  await session.handleMessage({
+    type: "cancel_agent_request",
+    agentId,
+    turnId: "turn-stale",
+    requestId: "cancel-stale",
+  });
+  expect(cancelAgentRun).toHaveBeenCalledTimes(1);
+});
+
 test("legacy cancel_agent_request reports refusal through the activity log", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";
   const messages: SessionOutboundMessage[] = [];

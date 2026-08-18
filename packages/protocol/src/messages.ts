@@ -1637,6 +1637,7 @@ export const RefreshAgentRequestMessageSchema = z.object({
 export const CancelAgentRequestMessageSchema = z.object({
   type: z.literal("cancel_agent_request"),
   agentId: z.string(),
+  turnId: z.string().trim().min(1).optional(),
   requestId: z.string().optional(),
 });
 

@@ -110,6 +110,7 @@ import {
 } from "./websocket/physical-socket.js";
 
 const WS_CLOSE_DAEMON_AUTH_FAILED = 4401;
+const MAYA_RESTRICTED_MAX_WEBSOCKET_PAYLOAD_BYTES = 512 * 1024;
 
 export interface ExternalSocketMetadata {
   transport: "relay";
@@ -806,6 +807,7 @@ export class VoiceAssistantWebSocketServer {
     const wss = new WebSocketServer({
       server,
       path: "/ws",
+      maxPayload: MAYA_RESTRICTED_MAX_WEBSOCKET_PAYLOAD_BYTES,
       handleProtocols: (protocols) => selectWebSocketProtocol(protocols, password),
       verifyClient: ({ req }, callback) => {
         this.verifyWsUpgrade(
@@ -1791,7 +1793,8 @@ export class VoiceAssistantWebSocketServer {
   private bindSocketHandlers(ws: WebSocketLike): void {
     ws.on("message", (...args: unknown[]) => {
       const data = args[0] as Buffer | ArrayBuffer | Buffer[] | string;
-      this.handleRawMessage(ws, data);
+      const isBinary = args[1] === true;
+      this.handleRawMessage(ws, data, isBinary);
     });
 
     ws.on("close", async (...args: unknown[]) => {
@@ -2152,6 +2155,7 @@ export class VoiceAssistantWebSocketServer {
   private handleRawMessage(
     ws: WebSocketLike,
     data: Buffer | ArrayBuffer | Buffer[] | string,
+    isBinary: boolean,
   ): void {
     if (
       this.connectionLifecycle === "stopping" ||
@@ -2168,6 +2172,10 @@ export class VoiceAssistantWebSocketServer {
       activeConnection?.connectionLogger ?? pendingConnection?.connectionLogger ?? this.logger;
 
     try {
+      if (isBinary) {
+        log.warn("Rejected binary WebSocket frame in Maya restricted mode");
+        return;
+      }
       const buffer = bufferFromWsData(data);
       const binaryHandled = this.maybeHandleBinaryFrame({
         ws,

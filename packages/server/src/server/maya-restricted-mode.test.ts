@@ -301,6 +301,8 @@ describe("Maya restricted mode", () => {
   });
 
   test("preserves native approvals but rejects terminal and provider widening", () => {
+    expect(evaluate({ type: "cancel_agent_request", agentId: "agent", turnId: "turn-1", requestId: "cancel" })).toEqual({ allowed: true, reason: "allowed" });
+    expect(evaluate({ type: "cancel_agent_request", agentId: "agent", requestId: "missing-turn" })).toMatchObject({ allowed: false });
     expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "approval", response: { behavior: "allow" } })).toEqual({ allowed: true, reason: "allowed" });
     expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "deny", response: { behavior: "deny", interrupt: true, message: "cancel" } })).toEqual({ allowed: true, reason: "allowed" });
     expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "permissions", response: { behavior: "allow", updatedPermissions: [{ path: "/" }] } })).toMatchObject({ allowed: false });

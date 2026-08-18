@@ -24,8 +24,10 @@ const wsModuleMock = vi.hoisted(() => {
   class MockWebSocketServer {
     static instances: MockWebSocketServer[] = [];
     readonly handlers = new Map<string, (...args: unknown[]) => void>();
+    readonly options: Record<string, unknown>;
 
-    constructor(_options: unknown) {
+    constructor(options: unknown) {
+      this.options = options as Record<string, unknown>;
       MockWebSocketServer.instances.push(this);
     }
 
@@ -143,15 +145,6 @@ function sentTerminalFrames(
       (frame): frame is NonNullable<ReturnType<typeof decodeTerminalStreamFrame>> => frame !== null,
     );
 }
-
-const BinaryFrameSchema = z.object({
-  kind: z.literal("terminal"),
-  frame: z.object({
-    opcode: z.number(),
-    slot: z.number(),
-    payload: z.instanceof(Uint8Array),
-  }),
-});
 
 class MockSocket {
   readyState = 1;
@@ -703,7 +696,7 @@ describe("relay external socket reconnect behavior", () => {
     await server.close();
   });
 
-  test("logs control RPCs with the socket identity", async () => {
+  test("denies client shutdown without recording accepted control authority", async () => {
     const logger = createLogger();
     const server = createServer({ logger });
     const socket = new MockSocket();
@@ -725,17 +718,20 @@ describe("relay external socket reconnect behavior", () => {
     );
     await Promise.resolve();
 
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        connectionId: expect.stringMatching(/^conn_/),
-        transport: "relay",
-        relayConnectionId: "relay-conn-1",
-        clientId: "cid-control-log",
-        sessionId: "mock-session-id",
-        requestType: "shutdown_server_request",
-        requestId: "shutdown-1",
-        reason: "client_shutdown_rpc",
-      }),
+    expect(sentEnvelopes(socket)).toContainEqual({
+      type: "session",
+      message: {
+        type: "rpc_error",
+        payload: {
+          requestId: "shutdown-1",
+          requestType: "shutdown_server_request",
+          error: "Request is disabled in Maya restricted mode",
+          code: "access_denied",
+        },
+      },
+    });
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.anything(),
       "ws_control_rpc_received",
     );
 
@@ -761,7 +757,7 @@ describe("relay external socket reconnect behavior", () => {
         type: "session",
         message: {
           type: "provider_diagnostic_request",
-          provider: "grok",
+          provider: "codex",
           requestId: "slow-provider-diagnostic",
         },
       }),
@@ -798,7 +794,7 @@ describe("relay external socket reconnect behavior", () => {
         type: "session",
         message: {
           type: "provider_diagnostic_request",
-          provider: "grok",
+          provider: "codex",
           requestId: "slow-provider-diagnostic",
         },
       }),
@@ -846,7 +842,7 @@ describe("relay external socket reconnect behavior", () => {
         type: "session",
         message: {
           type: "provider_diagnostic_request",
-          provider: "grok",
+          provider: "codex",
           requestId: "failing-provider-diagnostic",
         },
       }),
@@ -1066,7 +1062,7 @@ describe("relay external socket reconnect behavior", () => {
     await server.close();
   });
 
-  test("routes inbound terminal frames to session.handleBinaryFrame", async () => {
+  test("rejects inbound terminal frames before session dispatch", async () => {
     const server = createServer();
 
     const socket = new MockSocket();
@@ -1088,16 +1084,12 @@ describe("relay external socket reconnect behavior", () => {
         }),
       ),
     );
-    expect(session.handleBinaryFrame).toHaveBeenCalledTimes(1);
-    const { frame } = BinaryFrameSchema.parse(session.handleBinaryFrame.mock.calls[0]?.[0]);
-    expect(frame.opcode).toBe(TerminalStreamOpcode.Input);
-    expect(frame.slot).toBe(9);
-    expect(new TextDecoder().decode(frame.payload)).toBe("ls\r");
+    expect(session.handleBinaryFrame).not.toHaveBeenCalled();
 
     await server.close();
   });
 
-  test("sends status error when async binary frame handling fails", async () => {
+  test("does not surface session binary errors because binary ingress is denied", async () => {
     const server = createServer();
 
     const socket = new MockSocket();
@@ -1122,18 +1114,9 @@ describe("relay external socket reconnect behavior", () => {
       ),
     );
 
-    await vi.waitFor(() => {
-      expect(sentEnvelopes(socket).slice(sentBeforeFrame)).toContainEqual({
-        type: "session",
-        message: {
-          type: "status",
-          payload: {
-            status: "error",
-            message: "Invalid message: binary exploded",
-          },
-        },
-      });
-    });
+    await Promise.resolve();
+    expect(session.handleBinaryFrame).not.toHaveBeenCalled();
+    expect(sentEnvelopes(socket).slice(sentBeforeFrame)).toEqual([]);
 
     await server.close();
   });
@@ -1217,17 +1200,17 @@ describe("Maya restricted mode production ingress", () => {
     await attachRelayAndHello({ server, socket, clientId: "maya-restricted-binary" });
     const session = sessionMock.instances[0];
 
-    socket.emit(
-      "message",
-      encodeTerminalStreamFrame({
-        opcode: TerminalStreamOpcode.Input,
-        slot: 1,
-        payload: "whoami",
-      }),
-    );
+    socket.emit("message", Buffer.from(JSON.stringify({ type: "ping" })), true);
     await Promise.resolve();
 
     expect(session.handleBinaryFrame).not.toHaveBeenCalled();
+    expect(sentEnvelopes(socket)).not.toContainEqual({ type: "pong" });
+    await server.close();
+  });
+
+  test("caps WebSocket payloads below the Paseo relay input bound", async () => {
+    const server = createServer();
+    expect(wsModuleMock.MockWebSocketServer.instances[0]?.options.maxPayload).toBe(512 * 1024);
     await server.close();
   });
 });

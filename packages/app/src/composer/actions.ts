@@ -69,7 +69,7 @@ export interface ComposerSendClient {
 }
 
 export interface ComposerCancelClient {
-  cancelAgent: (agentId: string) => Promise<void> | void;
+  cancelAgent: (agentId: string, turnId?: string) => Promise<void> | void;
 }
 
 export interface MessageSubmissionWriter {
@@ -153,6 +153,7 @@ export function removeComposerAttachmentAtIndex<T extends ComposerAttachment>(in
 export interface CancelComposerAgentInput {
   client: ComposerCancelClient | null;
   agentId: string;
+  turnId?: string;
   isAgentRunning: boolean;
   isCancellingAgent: boolean;
   isConnected: boolean;
@@ -162,7 +163,7 @@ export function cancelComposerAgent(input: CancelComposerAgentInput): Promise<vo
   if (!input.isAgentRunning || input.isCancellingAgent) return null;
   if (!input.isConnected || !input.client) return null;
   try {
-    return Promise.resolve(input.client.cancelAgent(input.agentId));
+    return Promise.resolve(input.client.cancelAgent(input.agentId, input.turnId));
   } catch (error) {
     return Promise.reject(error);
   }
