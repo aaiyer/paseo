@@ -98,6 +98,7 @@ import {
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
+import { evaluateMayaRestrictedSessionMessage } from "./maya-restricted-mode.js";
 import {
   APPLICATION_SOCKET_LEASE_CHECK_INTERVAL_MS,
   ApplicationSocketLease,
@@ -2114,16 +2115,7 @@ export class VoiceAssistantWebSocketServer {
       ws.close(WS_CLOSE_INVALID_HELLO, "Binary frames are not supported on Hub sessions");
       return true;
     }
-    void Promise.resolve(activeConnection.session.handleBinaryFrame(decodedFrame)).catch(
-      (error: unknown) => {
-        this.handleRawMessageError({
-          ws,
-          data: buffer,
-          error,
-          log: activeConnection.connectionLogger,
-        });
-      },
-    );
+    log.warn({ frameKind: decodedFrame.kind }, "Rejected binary frame in Maya restricted mode");
     return true;
   }
 
@@ -2256,6 +2248,32 @@ export class VoiceAssistantWebSocketServer {
     message: Extract<WSInboundMessage, { type: "session" }>,
   ): Promise<void> {
     this.recordInboundSessionRequestType(message.message.type);
+    const restrictedDecision = evaluateMayaRestrictedSessionMessage(
+      message.message,
+      await this.workspaceRegistry.list(),
+    );
+    if (!restrictedDecision.allowed) {
+      const requestId = "requestId" in message.message ? message.message.requestId : undefined;
+      activeConnection.connectionLogger.warn(
+        { requestType: message.message.type, reason: restrictedDecision.reason },
+        "Rejected session request in Maya restricted mode",
+      );
+      if (typeof requestId === "string") {
+        this.sendToClient(
+          ws,
+          wrapSessionMessage({
+            type: "rpc_error",
+            payload: {
+              requestId,
+              requestType: message.message.type,
+              error: "Request is disabled in Maya restricted mode",
+              code: "access_denied",
+            },
+          }),
+        );
+      }
+      return;
+    }
     const controlRpc = getControlRpcLogInfo(message.message);
     if (controlRpc) {
       const identity = this.socketIdentities.get(ws);

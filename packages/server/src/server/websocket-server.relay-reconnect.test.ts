@@ -1166,3 +1166,68 @@ describe("relay external socket reconnect behavior", () => {
     await server.close();
   });
 });
+
+describe("Maya restricted mode production ingress", () => {
+  beforeEach(() => {
+    sessionMock.instances.length = 0;
+    wsModuleMock.MockWebSocketServer.instances.length = 0;
+  });
+
+  test("returns access_denied before a direct Git mutation reaches Session", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+    await attachRelayAndHello({ server, socket, clientId: "maya-restricted-git" });
+    const session = sessionMock.instances[0];
+
+    socket.emit(
+      "message",
+      JSON.stringify({
+        type: "session",
+        message: {
+          type: "checkout_commit_request",
+          cwd: "/tmp/repository",
+          message: "bypass",
+          addAll: true,
+          requestId: "git-mutation",
+        },
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(sentEnvelopes(socket)).toContainEqual({
+        type: "session",
+        message: {
+          type: "rpc_error",
+          payload: {
+            requestId: "git-mutation",
+            requestType: "checkout_commit_request",
+            error: "Request is disabled in Maya restricted mode",
+            code: "access_denied",
+          },
+        },
+      });
+    });
+    expect(session.handleMessage).not.toHaveBeenCalled();
+    await server.close();
+  });
+
+  test("drops terminal binary frames before they reach Session", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+    await attachRelayAndHello({ server, socket, clientId: "maya-restricted-binary" });
+    const session = sessionMock.instances[0];
+
+    socket.emit(
+      "message",
+      encodeTerminalStreamFrame({
+        opcode: TerminalStreamOpcode.Input,
+        slot: 1,
+        payload: "whoami",
+      }),
+    );
+    await Promise.resolve();
+
+    expect(session.handleBinaryFrame).not.toHaveBeenCalled();
+    await server.close();
+  });
+});
