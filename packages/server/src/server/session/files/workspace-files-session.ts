@@ -34,6 +34,7 @@ import {
 } from "../../file-explorer/service.js";
 import { workspaceFileObserver, type FileObserver } from "../../file-explorer/observer.js";
 import { getProjectIcon } from "../../../utils/project-icon.js";
+import type { MayaRestrictedWorkspaceAuthority } from "../../maya-restricted-mode.js";
 
 /**
  * What a workspace file-access request reaches outside its own domain: the
@@ -78,28 +79,60 @@ export class WorkspaceFilesSession {
     this.fileObserver = options.fileObserver ?? workspaceFileObserver;
   }
 
-  async handleFileSubscribeRequest(request: FileSubscribeRequest): Promise<void> {
+  async handleFileSubscribeRequest(
+    request: FileSubscribeRequest,
+    authority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     this.fileSubscriptions.get(request.subscriptionId)?.();
+    const retainedAuthority = authority?.retain();
+    let active = true;
+    let observerUnsubscribe: (() => void) | null = null;
+    const unsubscribe = () => {
+      if (!active) return;
+      active = false;
+      observerUnsubscribe?.();
+      void retainedAuthority?.release();
+    };
     try {
       const subscription = await this.fileObserver.subscribe(
-        { cwd: request.cwd, path: request.path },
+        { cwd: authority?.rootAccessPath ?? request.cwd, path: request.path },
         (version) => {
-          this.host.emit({
-            type: "fs.file.update",
-            payload: { subscriptionId: request.subscriptionId, version },
-          });
+          void (async () => {
+            if (
+              this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe ||
+              (retainedAuthority && !(await retainedAuthority.isCurrent()))
+            ) {
+              unsubscribe();
+              if (this.fileSubscriptions.get(request.subscriptionId) === unsubscribe) {
+                this.fileSubscriptions.delete(request.subscriptionId);
+              }
+              return;
+            }
+            this.host.emit({
+              type: "fs.file.update",
+              payload: {
+                subscriptionId: request.subscriptionId,
+                version: { ...version, cwd: request.cwd },
+              },
+            });
+          })();
         },
       );
-      this.fileSubscriptions.set(request.subscriptionId, subscription.unsubscribe);
+      observerUnsubscribe = subscription.unsubscribe;
+      if (retainedAuthority && !(await retainedAuthority.isCurrent())) {
+        throw new Error("workspace authority changed while opening file subscription");
+      }
+      this.fileSubscriptions.set(request.subscriptionId, unsubscribe);
       this.host.emit({
         type: "fs.file.subscribe.response",
         payload: {
           subscriptionId: request.subscriptionId,
-          initial: subscription.initial,
+          initial: { ...subscription.initial, cwd: request.cwd },
           requestId: request.requestId,
         },
       });
     } catch (error) {
+      unsubscribe();
       this.host.emit({
         type: "fs.file.subscribe.response",
         payload: {
@@ -218,9 +251,14 @@ export class WorkspaceFilesSession {
     this.fileSubscriptions.clear();
   }
 
-  async handleFileExplorerRequest(request: FileExplorerRequest, source?: object): Promise<void> {
+  async handleFileExplorerRequest(
+    request: FileExplorerRequest,
+    source?: object,
+    authority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     const { cwd: workspaceCwd, path: requestedPath = ".", mode, requestId } = request;
     const cwd = workspaceCwd.trim();
+    const readRoot = authority?.rootAccessPath ?? cwd;
     if (!cwd) {
       this.host.emit(
         {
@@ -243,7 +281,7 @@ export class WorkspaceFilesSession {
     try {
       if (mode === "list") {
         const directory = await listDirectoryEntries({
-          root: cwd,
+          root: readRoot,
           relativePath: requestedPath,
         });
 
@@ -264,42 +302,45 @@ export class WorkspaceFilesSession {
         );
       } else {
         if (request.acceptBinary && this.host.hasBinaryChannel()) {
-          await streamExplorerFile({ root: cwd, relativePath: requestedPath }, async (file) => {
-            await this.host.emitBinary(
-              encodeFileTransferFrame({
-                opcode: FileTransferOpcode.FileBegin,
-                requestId,
-                metadata: {
-                  mime: file.mimeType,
-                  size: file.size,
-                  encoding: file.encoding,
-                  modifiedAt: file.modifiedAt,
-                  revision: file.revision,
-                },
-              }),
-              source,
-            );
-            for await (const chunk of file.chunks) {
+          await streamExplorerFile(
+            { root: readRoot, relativePath: requestedPath },
+            async (file) => {
               await this.host.emitBinary(
                 encodeFileTransferFrame({
-                  opcode: FileTransferOpcode.FileChunk,
+                  opcode: FileTransferOpcode.FileBegin,
                   requestId,
-                  payload: chunk,
+                  metadata: {
+                    mime: file.mimeType,
+                    size: file.size,
+                    encoding: file.encoding,
+                    modifiedAt: file.modifiedAt,
+                    revision: file.revision,
+                  },
                 }),
                 source,
               );
-            }
-            await this.host.emitBinary(
-              encodeFileTransferFrame({
-                opcode: FileTransferOpcode.FileEnd,
-                requestId,
-              }),
-              source,
-            );
-          });
+              for await (const chunk of file.chunks) {
+                await this.host.emitBinary(
+                  encodeFileTransferFrame({
+                    opcode: FileTransferOpcode.FileChunk,
+                    requestId,
+                    payload: chunk,
+                  }),
+                  source,
+                );
+              }
+              await this.host.emitBinary(
+                encodeFileTransferFrame({
+                  opcode: FileTransferOpcode.FileEnd,
+                  requestId,
+                }),
+                source,
+              );
+            },
+          );
         } else {
           const file = await readExplorerFile({
-            root: cwd,
+            root: readRoot,
             relativePath: requestedPath,
           });
 

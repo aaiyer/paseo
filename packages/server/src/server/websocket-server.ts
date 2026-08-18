@@ -99,9 +99,10 @@ import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
 import {
+  acquireMayaRestrictedWorkspaceReadAuthority,
   evaluateMayaRestrictedSessionMessage,
-  evaluateMayaRestrictedWorkspaceReadIdentity,
 } from "./maya-restricted-mode.js";
+import type { MayaRestrictedWorkspaceAuthority } from "./maya-restricted-mode.js";
 import {
   APPLICATION_SOCKET_LEASE_CHECK_INTERVAL_MS,
   ApplicationSocketLease,
@@ -608,7 +609,8 @@ export class VoiceAssistantWebSocketServer {
   private readonly directorySync = new DirectorySyncService();
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
-  private readonly passwordVerifier = new BoundedDaemonPasswordVerifier();
+  private readonly passwordVerifier: BoundedDaemonPasswordVerifier;
+  private readonly ownsPasswordVerifier: boolean;
 
   constructor(
     server: HTTPServer,
@@ -655,6 +657,7 @@ export class VoiceAssistantWebSocketServer {
     workspaceSetupRuntime: WorkspaceSetupRuntime = new WorkspaceSetupRuntime(),
     pluginRuntime?: SessionOptions["pluginRuntime"],
     orchestrationSkills?: SessionOptions["orchestrationSkills"],
+    passwordVerifier?: BoundedDaemonPasswordVerifier,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
@@ -671,6 +674,8 @@ export class VoiceAssistantWebSocketServer {
     this.hubRelationships = hubRelationships ?? null;
     this.pluginRuntime = pluginRuntime;
     this.orchestrationSkills = orchestrationSkills;
+    this.passwordVerifier = passwordVerifier ?? new BoundedDaemonPasswordVerifier();
+    this.ownsPasswordVerifier = passwordVerifier === undefined;
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
@@ -1057,7 +1062,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   public async close(): Promise<void> {
-    this.passwordVerifier.dispose();
+    if (this.ownsPasswordVerifier) this.passwordVerifier.dispose();
     this.prepareForShutdown();
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
@@ -2271,15 +2276,39 @@ export class VoiceAssistantWebSocketServer {
   ): Promise<void> {
     this.recordInboundSessionRequestType(message.message.type);
     const restrictedWorkspaces = await this.workspaceRegistry.list();
-    let restrictedDecision = evaluateMayaRestrictedSessionMessage(
+    const restrictedDecision = evaluateMayaRestrictedSessionMessage(
       message.message,
       restrictedWorkspaces,
     );
+    let workspaceAuthority: MayaRestrictedWorkspaceAuthority | null = null;
     if (restrictedDecision.allowed) {
-      restrictedDecision = await evaluateMayaRestrictedWorkspaceReadIdentity(
-        message.message,
-        restrictedWorkspaces,
-      );
+      try {
+        workspaceAuthority = await acquireMayaRestrictedWorkspaceReadAuthority(
+          message.message,
+          restrictedWorkspaces,
+        );
+      } catch (error) {
+        activeConnection.connectionLogger.warn(
+          { err: error, requestType: message.message.type },
+          "Rejected workspace read with stale Maya authority",
+        );
+        const requestId = "requestId" in message.message ? message.message.requestId : undefined;
+        if (typeof requestId === "string") {
+          this.sendToClient(
+            ws,
+            wrapSessionMessage({
+              type: "rpc_error",
+              payload: {
+                requestId,
+                requestType: message.message.type,
+                error: "Request is disabled in Maya restricted mode",
+                code: "access_denied",
+              },
+            }),
+          );
+        }
+        return;
+      }
     }
     if (!restrictedDecision.allowed) {
       const requestId = "requestId" in message.message ? message.message.requestId : undefined;
@@ -2331,7 +2360,11 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const startMs = performance.now();
-    await activeConnection.session.handleMessage(message.message, ws);
+    try {
+      await activeConnection.session.handleMessage(message.message, ws, workspaceAuthority);
+    } finally {
+      await workspaceAuthority?.release();
+    }
     const durationMs = performance.now() - startMs;
     this.recordRequestLatency(message.message.type, durationMs);
 

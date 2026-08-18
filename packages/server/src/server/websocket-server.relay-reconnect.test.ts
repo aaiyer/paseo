@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Server as HTTPServer } from "http";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type pino from "pino";
@@ -12,7 +12,10 @@ import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import type { WorkspaceAutoName } from "./workspace-auto-name.js";
 import type { PersistedWorkspaceRecord, WorkspaceRegistry } from "./workspace-registry.js";
-import { deriveMayaRestrictedWorkspaceId } from "./maya-restricted-mode.js";
+import {
+  deriveMayaRestrictedWorkspaceId,
+  type MayaRestrictedWorkspaceAuthority,
+} from "./maya-restricted-mode.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
 import { createProviderSnapshotManagerStub } from "./test-utils/session-stubs.js";
 import {
@@ -1272,6 +1275,72 @@ describe("Maya restricted mode production ingress", () => {
         });
       });
       expect(session.handleMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("binds a one-shot workspace read to the validated root across path replacement", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "maya-restricted-bound-read-"));
+    const cwd = path.join(root, "workspace");
+    const displaced = path.join(root, "displaced");
+    await mkdir(path.join(cwd, ".git"), { recursive: true });
+    await writeFile(path.join(cwd, "identity.txt"), "validated-worktree");
+    const timestamp = "2026-08-19T00:00:00.000Z";
+    const workspace: PersistedWorkspaceRecord = {
+      workspaceId: await deriveMayaRestrictedWorkspaceId(cwd),
+      projectId: "project-maya",
+      cwd,
+      kind: "local_checkout",
+      displayName: "workspace",
+      title: null,
+      branch: "main",
+      worktreeRoot: cwd,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      archivedAt: null,
+      autoArchivedChangeRequestUrl: null,
+      pinnedAt: null,
+    };
+    const server = createServer({ workspaces: [workspace] });
+    const socket = new MockSocket();
+    let observed: string | null = null;
+
+    try {
+      await attachRelayAndHello({ server, socket, clientId: "maya-restricted-bound-read" });
+      const session = sessionMock.instances[0];
+      session.handleMessage.mockImplementationOnce(
+        async (_message, _source, authority: MayaRestrictedWorkspaceAuthority | null) => {
+          if (!authority) throw new Error("missing workspace authority");
+          await rename(cwd, displaced);
+          await mkdir(path.join(cwd, ".git"), { recursive: true });
+          await writeFile(path.join(cwd, "identity.txt"), "replacement-worktree");
+          observed = await readFile(path.join(authority.rootAccessPath, "identity.txt"), "utf8");
+        },
+      );
+
+      socket.emit(
+        "message",
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "file_explorer_request",
+            cwd,
+            path: "identity.txt",
+            mode: "file",
+            requestId: "bound-read",
+          },
+        }),
+      );
+
+      await vi.waitFor(() => expect(observed).toBe("validated-worktree"));
+      await expect(readFile(path.join(cwd, "identity.txt"), "utf8")).resolves.toBe(
+        "replacement-worktree",
+      );
     } finally {
       await server.close();
       await rm(root, { recursive: true, force: true });

@@ -1,14 +1,16 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import pino from "pino";
 import {
   decodeFileTransferFrame,
@@ -22,6 +24,8 @@ import {
 } from "./workspace-files-session.js";
 import { DownloadTokenStore } from "../../file-download/token-store.js";
 import type { SessionOutboundMessage } from "../../messages.js";
+import type { FileObserver } from "../../file-explorer/observer.js";
+import { openMayaRestrictedWorkspaceAuthority } from "../../maya-restricted-mode.js";
 
 const tempDirs: string[] = [];
 
@@ -41,6 +45,7 @@ function makeSubsystem(
   options: {
     hasBinaryChannel?: boolean;
     emitBinary?: (frame: Uint8Array) => Promise<void> | void;
+    fileObserver?: FileObserver;
   } = {},
 ) {
   const emitted: SessionOutboundMessage[] = [];
@@ -60,6 +65,7 @@ function makeSubsystem(
     downloadTokenStore: new DownloadTokenStore({ ttlMs: 60_000 }),
     paseoHome,
     logger: pino({ level: "silent" }),
+    fileObserver: options.fileObserver,
   });
   return {
     subsystem,
@@ -346,6 +352,78 @@ describe("WorkspaceFilesSession", () => {
     }
     expect(message.payload.error).toBeNull();
     expect(message.payload.file).not.toBeNull();
+  });
+
+  test("cancels a restricted file subscription before emitting after root replacement", async () => {
+    const root = makeDir("workspace-files-authority-");
+    const cwd = join(root, "workspace");
+    const displaced = join(root, "displaced");
+    mkdirSync(join(cwd, ".git"), { recursive: true });
+    writeFileSync(join(cwd, "notes.txt"), "validated");
+    let listener:
+      | ((version: {
+          status: "ready";
+          cwd: string;
+          path: string;
+          size: number;
+          modifiedAt: string;
+        }) => void)
+      | null = null;
+    let unsubscribeCalls = 0;
+    const fileObserver = {
+      subscribe: async (
+        input: { cwd: string; path: string },
+        next: NonNullable<typeof listener>,
+      ) => {
+        listener = next;
+        return {
+          initial: {
+            status: "ready" as const,
+            cwd: input.cwd,
+            path: input.path,
+            size: 9,
+            modifiedAt: "2026-08-19T00:00:00.000Z",
+          },
+          unsubscribe: () => {
+            unsubscribeCalls += 1;
+          },
+        };
+      },
+    } as unknown as FileObserver;
+    const { subsystem, emitted } = makeSubsystem({ fileObserver });
+    const authority = await openMayaRestrictedWorkspaceAuthority(cwd);
+
+    try {
+      await subsystem.handleFileSubscribeRequest(
+        {
+          type: "fs.file.subscribe.request",
+          cwd,
+          path: "notes.txt",
+          subscriptionId: "restricted-file",
+          requestId: "restricted-open",
+        },
+        authority,
+      );
+      await authority.release();
+      renameSync(cwd, displaced);
+      mkdirSync(join(cwd, ".git"), { recursive: true });
+      writeFileSync(join(cwd, "notes.txt"), "replacement");
+
+      listener?.({
+        status: "ready",
+        cwd,
+        path: "notes.txt",
+        size: 11,
+        modifiedAt: "2026-08-19T00:00:01.000Z",
+      });
+
+      await vi.waitFor(() => expect(unsubscribeCalls).toBe(1));
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0].type).toBe("fs.file.subscribe.response");
+    } finally {
+      subsystem.dispose();
+      await authority.release();
+    }
   });
 
   test("streams binary frames when the client accepts binary and has a channel", async () => {

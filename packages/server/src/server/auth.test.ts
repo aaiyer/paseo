@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  BoundedDaemonPasswordVerifier,
   extractHttpBearerToken,
   extractWsBearerProtocol,
   extractWsBearerToken,
@@ -73,10 +74,20 @@ describe("daemon bearer validator", () => {
 
 describe("agent MCP request authorizer", () => {
   const CAPABILITY_TOKEN = "cap-token-abc123";
+  const authorize = async (
+    input: Omit<Parameters<typeof isAgentMcpRequestAuthorized>[0], "verifier" | "peer">,
+  ): Promise<boolean> => {
+    const verifier = new BoundedDaemonPasswordVerifier();
+    try {
+      return await isAgentMcpRequestAuthorized({ ...input, verifier, peer: "test-peer" });
+    } finally {
+      verifier.dispose();
+    }
+  };
 
   test("allows any request when no daemon password is configured", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorize({
         password: undefined,
         capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: undefined,
@@ -86,7 +97,7 @@ describe("agent MCP request authorizer", () => {
 
   test("accepts the injected capability token", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorize({
         password: CORRECT_PASSWORD_HASH,
         capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: `Bearer ${CAPABILITY_TOKEN}`,
@@ -96,7 +107,7 @@ describe("agent MCP request authorizer", () => {
 
   test("still accepts a valid daemon-password bearer", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorize({
         password: CORRECT_PASSWORD_HASH,
         capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: "Bearer correct-password",
@@ -106,14 +117,14 @@ describe("agent MCP request authorizer", () => {
 
   test("rejects requests presenting neither the token nor a valid password", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorize({
         password: CORRECT_PASSWORD_HASH,
         capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: undefined,
       }),
     ).toBe(false);
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorize({
         password: CORRECT_PASSWORD_HASH,
         capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: "Bearer wrong-token",

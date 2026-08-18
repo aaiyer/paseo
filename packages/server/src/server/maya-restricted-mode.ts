@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { constants, promises as fs } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import type { SessionInboundMessage } from "./messages.js";
@@ -57,6 +58,54 @@ type RestrictedWorkspace = Pick<PersistedWorkspaceRecord, "workspaceId" | "cwd" 
 const ALLOWED = { allowed: true, reason: "allowed" } as const;
 const MAYA_WORKSPACE_IDENTITY_DOMAIN = "maya-paseo-workspace-identity-v1";
 const MAX_GIT_LINK_BYTES = 4096;
+const OPEN_DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+
+export interface MayaRestrictedWorkspaceAuthority {
+  readonly cwd: string;
+  readonly workspaceId: string;
+  readonly rootAccessPath: string;
+  retain(): MayaRestrictedWorkspaceAuthority;
+  release(): Promise<void>;
+  isCurrent(): Promise<boolean>;
+}
+
+class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAuthority {
+  private references = 1;
+
+  constructor(
+    readonly cwd: string,
+    readonly workspaceId: string,
+    readonly rootAccessPath: string,
+    private readonly rootHandle: FileHandle,
+    private readonly commonDirectoryHandle: FileHandle,
+  ) {}
+
+  retain(): MayaRestrictedWorkspaceAuthority {
+    if (this.references === 0) throw new Error("workspace authority is closed");
+    this.references += 1;
+    return this;
+  }
+
+  async release(): Promise<void> {
+    if (this.references === 0) return;
+    this.references -= 1;
+    if (this.references !== 0) return;
+    await Promise.allSettled([this.rootHandle.close(), this.commonDirectoryHandle.close()]);
+  }
+
+  async isCurrent(): Promise<boolean> {
+    try {
+      const current = await openMayaRestrictedWorkspaceAuthority(this.cwd);
+      try {
+        return current.workspaceId === this.workspaceId;
+      } finally {
+        await current.release();
+      }
+    } catch {
+      return false;
+    }
+  }
+}
 
 function denied(reason: string): MayaRestrictedModeDecision {
   return { allowed: false, reason };
@@ -113,56 +162,97 @@ export function isMayaRestrictedWorkspaceReadRequest(
   }
 }
 
+/** Opens and binds the exact host-catalog identity used by downstream readers. */
+export async function openMayaRestrictedWorkspaceAuthority(
+  cwd: string,
+): Promise<MayaRestrictedWorkspaceAuthority> {
+  if (process.platform !== "linux") throw new Error("Maya restricted mode requires Linux");
+  const expectedRoot = path.resolve(cwd);
+  const rootHandle = await fs.open(expectedRoot, OPEN_DIRECTORY_FLAGS);
+  let commonDirectoryHandle: FileHandle | null = null;
+  try {
+    const rootAccessPath = `/proc/self/fd/${rootHandle.fd}`;
+    const [root, rootMetadata] = await Promise.all([
+      fs.realpath(rootAccessPath),
+      rootHandle.stat({ bigint: true }),
+    ]);
+    if (root !== expectedRoot || !rootMetadata.isDirectory()) {
+      throw new Error("workspace root is not the canonical directory");
+    }
+
+    const dotGit = path.join(rootAccessPath, ".git");
+    const dotGitMetadata = await fs.lstat(dotGit, { bigint: true });
+    let commonDirectory: string;
+    if (dotGitMetadata.isDirectory() && !dotGitMetadata.isSymbolicLink()) {
+      commonDirectory = dotGit;
+    } else if (dotGitMetadata.isFile() && !dotGitMetadata.isSymbolicLink()) {
+      const gitDirectory = await readBoundedGitPathFile(dotGit, "gitdir: ", rootAccessPath);
+      const gitDirectoryHandle = await fs.open(gitDirectory, OPEN_DIRECTORY_FLAGS);
+      try {
+        const gitDirectoryAccessPath = `/proc/self/fd/${gitDirectoryHandle.fd}`;
+        commonDirectory = await readBoundedGitPathFile(
+          path.join(gitDirectoryAccessPath, "commondir"),
+          "",
+          gitDirectoryAccessPath,
+        );
+      } finally {
+        await gitDirectoryHandle.close();
+      }
+    } else {
+      throw new Error("workspace .git entry is unsafe");
+    }
+
+    commonDirectoryHandle = await fs.open(commonDirectory, OPEN_DIRECTORY_FLAGS);
+    const commonDirectoryAccessPath = `/proc/self/fd/${commonDirectoryHandle.fd}`;
+    const [canonicalCommonDirectory, commonMetadata, finalRoot, finalRootMetadata] =
+      await Promise.all([
+        fs.realpath(commonDirectoryAccessPath),
+        commonDirectoryHandle.stat({ bigint: true }),
+        fs.realpath(rootAccessPath),
+        rootHandle.stat({ bigint: true }),
+      ]);
+    if (!commonMetadata.isDirectory()) throw new Error("Git common directory is unsafe");
+    if (
+      finalRoot !== root ||
+      !finalRootMetadata.isDirectory() ||
+      finalRootMetadata.dev !== rootMetadata.dev ||
+      finalRootMetadata.ino !== rootMetadata.ino
+    ) {
+      throw new Error("workspace root changed during identity validation");
+    }
+
+    const digest = createHash("sha256");
+    for (const field of [
+      MAYA_WORKSPACE_IDENTITY_DOMAIN,
+      root,
+      `${rootMetadata.dev}:${rootMetadata.ino}`,
+      canonicalCommonDirectory,
+      `${commonMetadata.dev}:${commonMetadata.ino}`,
+    ]) {
+      digest.update(field);
+      digest.update("\0");
+    }
+    return new OpenMayaRestrictedWorkspaceAuthority(
+      root,
+      `wks_${digest.digest("hex").slice(0, 16)}`,
+      rootAccessPath,
+      rootHandle,
+      commonDirectoryHandle,
+    );
+  } catch (error) {
+    await Promise.allSettled([rootHandle.close(), commonDirectoryHandle?.close()]);
+    throw error;
+  }
+}
+
 /** Recomputes the exact host-catalog identity from the live checkout. */
 export async function deriveMayaRestrictedWorkspaceId(cwd: string): Promise<string> {
-  const root = await fs.realpath(cwd);
-  if (root !== path.resolve(cwd)) {
-    throw new Error("workspace root is not canonical");
+  const authority = await openMayaRestrictedWorkspaceAuthority(cwd);
+  try {
+    return authority.workspaceId;
+  } finally {
+    await authority.release();
   }
-  const rootMetadata = await fs.lstat(root, { bigint: true });
-  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
-    throw new Error("workspace root is not a real directory");
-  }
-
-  const dotGit = path.join(root, ".git");
-  const dotGitMetadata = await fs.lstat(dotGit, { bigint: true });
-  let commonDirectory: string;
-  if (dotGitMetadata.isDirectory() && !dotGitMetadata.isSymbolicLink()) {
-    commonDirectory = await fs.realpath(dotGit);
-  } else if (dotGitMetadata.isFile() && !dotGitMetadata.isSymbolicLink()) {
-    const gitDirectory = await readBoundedGitPathFile(dotGit, "gitdir: ", root);
-    const commondir = path.join(gitDirectory, "commondir");
-    commonDirectory = await readBoundedGitPathFile(commondir, "", gitDirectory);
-  } else {
-    throw new Error("workspace .git entry is unsafe");
-  }
-
-  const canonicalCommonDirectory = await fs.realpath(commonDirectory);
-  const commonMetadata = await fs.lstat(canonicalCommonDirectory, { bigint: true });
-  if (!commonMetadata.isDirectory() || commonMetadata.isSymbolicLink()) {
-    throw new Error("Git common directory is unsafe");
-  }
-  const finalRootMetadata = await fs.lstat(root, { bigint: true });
-  if (
-    !finalRootMetadata.isDirectory() ||
-    finalRootMetadata.dev !== rootMetadata.dev ||
-    finalRootMetadata.ino !== rootMetadata.ino
-  ) {
-    throw new Error("workspace root changed during identity validation");
-  }
-
-  const digest = createHash("sha256");
-  for (const field of [
-    MAYA_WORKSPACE_IDENTITY_DOMAIN,
-    root,
-    `${rootMetadata.dev}:${rootMetadata.ino}`,
-    canonicalCommonDirectory,
-    `${commonMetadata.dev}:${commonMetadata.ino}`,
-  ]) {
-    digest.update(field);
-    digest.update("\0");
-  }
-  return `wks_${digest.digest("hex").slice(0, 16)}`;
 }
 
 async function readBoundedGitPathFile(
@@ -188,21 +278,24 @@ async function readBoundedGitPathFile(
   return fs.realpath(path.resolve(relativeTo, value.slice(prefix.length)));
 }
 
-export async function evaluateMayaRestrictedWorkspaceReadIdentity(
+export async function acquireMayaRestrictedWorkspaceReadAuthority(
   message: SessionInboundMessage,
   workspaces: readonly RestrictedWorkspace[],
-): Promise<MayaRestrictedModeDecision> {
-  if (!isMayaRestrictedWorkspaceReadRequest(message)) return ALLOWED;
+): Promise<MayaRestrictedWorkspaceAuthority | null> {
+  if (!isMayaRestrictedWorkspaceReadRequest(message)) return null;
   const workspace = workspaces.find(
     (candidate) => candidate.archivedAt === null && candidate.cwd === message.cwd,
   );
-  if (!workspace) return denied("cwd is not an active pre-registered workspace");
+  if (!workspace) throw new Error("cwd is not an active pre-registered workspace");
+  const authority = await openMayaRestrictedWorkspaceAuthority(message.cwd);
   try {
-    return (await deriveMayaRestrictedWorkspaceId(message.cwd)) === workspace.workspaceId
-      ? ALLOWED
-      : denied("workspace filesystem identity no longer matches the catalog");
-  } catch {
-    return denied("workspace filesystem identity cannot be validated");
+    if (authority.workspaceId !== workspace.workspaceId) {
+      throw new Error("workspace filesystem identity no longer matches the catalog");
+    }
+    return authority;
+  } catch (error) {
+    await authority.release();
+    throw error;
   }
 }
 

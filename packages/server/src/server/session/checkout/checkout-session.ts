@@ -55,6 +55,7 @@ import {
 import { runGitCommand } from "../../../utils/run-git-command.js";
 import { expandTilde } from "../../../utils/path.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
+import type { MayaRestrictedWorkspaceAuthority } from "../../maya-restricted-mode.js";
 
 /**
  * The collaborators a checkout command reaches that are NOT part of the checkout
@@ -230,9 +231,12 @@ export class CheckoutSession {
     }
   }
 
-  async handleStatusRequest(msg: CheckoutStatusRequest): Promise<void> {
+  async handleStatusRequest(
+    msg: CheckoutStatusRequest,
+    authority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     const { cwd, requestId } = msg;
-    const resolvedCwd = expandTilde(cwd);
+    const resolvedCwd = authority?.rootAccessPath ?? expandTilde(cwd);
 
     try {
       const snapshot = await this.workspaceGitService.getSnapshot(resolvedCwd);
@@ -267,11 +271,16 @@ export class CheckoutSession {
     }
   }
 
-  async handleCommitsListRequest(msg: CheckoutCommitsListRequest): Promise<void> {
+  async handleCommitsListRequest(
+    msg: CheckoutCommitsListRequest,
+    authority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     const { cwd, requestId } = msg;
 
     try {
-      const { baseRef, commits } = await listCheckoutCommits({ cwd: expandTilde(cwd) });
+      const { baseRef, commits } = await listCheckoutCommits({
+        cwd: authority?.rootAccessPath ?? expandTilde(cwd),
+      });
       this.host.emit({
         type: "checkout.commits.list.response",
         payload: { cwd, baseRef, commits, error: null, requestId },
@@ -284,7 +293,10 @@ export class CheckoutSession {
     }
   }
 
-  async handleCommitFileDiffRequest(msg: CheckoutCommitFileDiffRequest): Promise<void> {
+  async handleCommitFileDiffRequest(
+    msg: CheckoutCommitFileDiffRequest,
+    authority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     const { cwd, sha, path, requestId } = msg;
 
     try {
@@ -292,7 +304,11 @@ export class CheckoutSession {
       if (path.length === 0 || isAbsolute(path) || path.split(/[\\/]/).includes("..")) {
         throw new Error(`Invalid path: ${path}`);
       }
-      const file = await getCommitFileDiff({ cwd: expandTilde(cwd), sha, path });
+      const file = await getCommitFileDiff({
+        cwd: authority?.rootAccessPath ?? expandTilde(cwd),
+        sha,
+        path,
+      });
       this.host.emit({
         type: "checkout.commits.file_diff.response",
         payload: { cwd, sha, path, file, error: null, requestId },
@@ -400,32 +416,60 @@ export class CheckoutSession {
     }
   }
 
-  async handleSubscribeDiffRequest(msg: SubscribeCheckoutDiffRequest): Promise<void> {
-    const cwd = expandTilde(msg.cwd);
+  async handleSubscribeDiffRequest(
+    msg: SubscribeCheckoutDiffRequest,
+    authority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
+    const cwd = authority?.rootAccessPath ?? expandTilde(msg.cwd);
     this.diffSubscriptions.get(msg.subscriptionId)?.();
     const abort = new AbortController();
-    const unsubscribe = () => abort.abort();
+    const retainedAuthority = authority?.retain();
+    let active = true;
+    const unsubscribe = () => {
+      if (!active) return;
+      active = false;
+      abort.abort();
+      void retainedAuthority?.release();
+    };
     this.diffSubscriptions.set(msg.subscriptionId, unsubscribe);
 
     try {
       const subscription = await this.checkoutDiffManager.subscribe(
         { cwd, compare: msg.compare, signal: abort.signal },
         (snapshot) => {
-          this.host.emit({
-            type: "checkout_diff_update",
-            payload: {
-              subscriptionId: msg.subscriptionId,
-              ...snapshot,
-            },
-          });
+          void (async () => {
+            if (
+              this.diffSubscriptions.get(msg.subscriptionId) !== unsubscribe ||
+              (retainedAuthority && !(await retainedAuthority.isCurrent()))
+            ) {
+              unsubscribe();
+              if (this.diffSubscriptions.get(msg.subscriptionId) === unsubscribe) {
+                this.diffSubscriptions.delete(msg.subscriptionId);
+              }
+              return;
+            }
+            this.host.emit({
+              type: "checkout_diff_update",
+              payload: {
+                subscriptionId: msg.subscriptionId,
+                ...snapshot,
+                cwd: msg.cwd,
+              },
+            });
+          })();
         },
       );
+
+      if (retainedAuthority && !(await retainedAuthority.isCurrent())) {
+        throw new Error("workspace authority changed while opening diff subscription");
+      }
 
       this.host.emit({
         type: "subscribe_checkout_diff_response",
         payload: {
           subscriptionId: msg.subscriptionId,
           ...subscription.initial,
+          cwd: msg.cwd,
           requestId: msg.requestId,
         },
       });
@@ -444,9 +488,12 @@ export class CheckoutSession {
     unsubscribe?.();
   }
 
-  async handleRefreshRequest(msg: CheckoutRefreshRequest): Promise<void> {
+  async handleRefreshRequest(
+    msg: CheckoutRefreshRequest,
+    authority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     const { cwd, requestId } = msg;
-    const resolvedCwd = expandTilde(cwd);
+    const resolvedCwd = authority?.rootAccessPath ?? expandTilde(cwd);
 
     try {
       (await this.resolveForgeService(resolvedCwd))?.service.invalidate({ cwd: resolvedCwd });

@@ -5,10 +5,10 @@ import { Worker } from "node:worker_threads";
 import type { RequestHandler } from "express";
 
 export const DAEMON_PASSWORD_BCRYPT_COST = 12;
-const WS_AUTH_MAX_PENDING = 4;
-const WS_AUTH_MAX_ATTEMPTS_PER_WINDOW = 8;
-const WS_AUTH_ATTEMPT_WINDOW_MS = 10_000;
-const WS_AUTH_MAX_TRACKED_PEERS = 1024;
+const AUTH_MAX_PENDING = 4;
+const AUTH_MAX_ATTEMPTS_PER_WINDOW = 8;
+const AUTH_ATTEMPT_WINDOW_MS = 10_000;
+const AUTH_MAX_TRACKED_PEERS = 1024;
 const BCRYPT_MODULE_PATH = createRequire(import.meta.url).resolve("bcryptjs");
 const BCRYPT_WORKER_SOURCE = String.raw`
 const { parentPort, workerData } = require("node:worker_threads");
@@ -39,7 +39,7 @@ interface PeerAttemptWindow {
   attempts: number;
 }
 
-/** Fixed-capacity, off-main-thread verifier for pre-authenticated WebSockets. */
+/** Fixed-capacity, off-main-thread verifier shared by HTTP and WebSocket ingress. */
 export class BoundedDaemonPasswordVerifier {
   private worker: Worker | null = null;
   private nextId = 1;
@@ -55,7 +55,7 @@ export class BoundedDaemonPasswordVerifier {
     if (!input.password) return "authorized";
     if (!this.admitPeer(input.peer)) return "rate_limited";
     if (input.token === null) return "invalid";
-    if (this.disposed || this.pending.size >= WS_AUTH_MAX_PENDING) return "busy";
+    if (this.disposed || this.pending.size >= AUTH_MAX_PENDING) return "busy";
 
     const worker = this.ensureWorker();
     const id = this.nextId;
@@ -83,8 +83,8 @@ export class BoundedDaemonPasswordVerifier {
   private admitPeer(peer: string): boolean {
     const now = Date.now();
     const existing = this.peerAttempts.get(peer);
-    if (!existing || now - existing.startedAt >= WS_AUTH_ATTEMPT_WINDOW_MS) {
-      if (!existing && this.peerAttempts.size >= WS_AUTH_MAX_TRACKED_PEERS) {
+    if (!existing || now - existing.startedAt >= AUTH_ATTEMPT_WINDOW_MS) {
+      if (!existing && this.peerAttempts.size >= AUTH_MAX_TRACKED_PEERS) {
         const oldest = this.peerAttempts.keys().next().value as string | undefined;
         if (oldest !== undefined) this.peerAttempts.delete(oldest);
       }
@@ -92,7 +92,7 @@ export class BoundedDaemonPasswordVerifier {
       return true;
     }
     existing.attempts += 1;
-    return existing.attempts <= WS_AUTH_MAX_ATTEMPTS_PER_WINDOW;
+    return existing.attempts <= AUTH_MAX_ATTEMPTS_PER_WINDOW;
   }
 
   private ensureWorker(): Worker {
@@ -213,6 +213,7 @@ export function extractWsBearerToken(protocol: string | null): string | null {
 
 export function createRequireBearerMiddleware(
   auth: DaemonAuthConfig | undefined,
+  verifier: BoundedDaemonPasswordVerifier,
   onReject?: (context: BearerAuthRejectContext) => void,
 ): RequestHandler {
   const password = auth?.password;
@@ -225,7 +226,12 @@ export function createRequireBearerMiddleware(
     void (async () => {
       try {
         const token = extractHttpBearerToken(req.header("authorization"));
-        if (!(await isBearerTokenValidAsync({ password, token }))) {
+        const verification = await verifier.verify({
+          password,
+          token,
+          peer: req.socket.remoteAddress ?? "unknown",
+        });
+        if (verification !== "authorized") {
           onReject?.({
             path: req.path,
             method: req.method,
@@ -288,6 +294,8 @@ export async function isAgentMcpRequestAuthorized(input: {
   password: string | undefined;
   capabilityToken: string | null;
   authorizationHeader: string | undefined;
+  verifier: BoundedDaemonPasswordVerifier;
+  peer: string;
 }): Promise<boolean> {
   if (!input.password) {
     return true;
@@ -302,5 +310,11 @@ export async function isAgentMcpRequestAuthorized(input: {
       return true;
     }
   }
-  return isBearerTokenValidAsync({ password: input.password, token });
+  return (
+    (await input.verifier.verify({
+      password: input.password,
+      token,
+      peer: input.peer,
+    })) === "authorized"
+  );
 }

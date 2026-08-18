@@ -201,6 +201,7 @@ import {
   WORKSPACE_SEARCH_HIDDEN_DIRECTORIES,
 } from "../utils/directory-suggestions.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
+import type { MayaRestrictedWorkspaceAuthority } from "./maya-restricted-mode.js";
 import type { Resolvable } from "./speech/provider-resolver.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
 import type pino from "pino";
@@ -1802,7 +1803,11 @@ export class Session {
   /**
    * Main entry point for processing session messages
    */
-  public async handleMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
+  public async handleMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+    workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     this.inflightRequests++;
     if (this.inflightRequests > this.peakInflightRequests) {
       this.peakInflightRequests = this.inflightRequests;
@@ -1831,7 +1836,7 @@ export class Session {
         return;
       }
       try {
-        await this.dispatchInboundMessage(msg, source);
+        await this.dispatchInboundMessage(msg, source, workspaceAuthority);
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
         this.sessionLogger.error({ err }, "Error handling message");
@@ -1873,7 +1878,11 @@ export class Session {
     this.scopes = [...scopes];
   }
 
-  private async dispatchInboundMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
+  private async dispatchInboundMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+    workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> {
     const promise =
       this.dispatchVoiceAndControlMessage(msg) ??
       this.dispatchAgentRewindMessage(msg) ??
@@ -1882,10 +1891,10 @@ export class Session {
       this.dispatchHubExecutionMessage(msg) ??
       this.dispatchAgentLifecycleMessage(msg) ??
       this.dispatchAgentConfigMessage(msg) ??
-      this.dispatchCheckoutMessage(msg) ??
+      this.dispatchCheckoutMessage(msg, workspaceAuthority) ??
       this.dispatchWorkspaceRecoveryMessage(msg) ??
       this.dispatchWorkspaceAndProjectMessage(msg) ??
-      this.dispatchWorkspaceFileMessage(msg, source) ??
+      this.dispatchWorkspaceFileMessage(msg, source, workspaceAuthority) ??
       this.dispatchProviderMessage(msg) ??
       this.dispatchOrchestrationSkillsMessage(msg) ??
       this.dispatchPluginDirectoryMessage(msg) ??
@@ -2286,14 +2295,17 @@ export class Session {
   }
 
   // eslint-disable-next-line complexity
-  private dispatchCheckoutMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchCheckoutMessage(
+    msg: SessionInboundMessage,
+    workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null,
+  ): Promise<void> | undefined {
     switch (msg.type) {
       case "checkout_status_request":
-        return this.checkoutSession.handleStatusRequest(msg);
+        return this.checkoutSession.handleStatusRequest(msg, workspaceAuthority);
       case "checkout.commits.list.request":
-        return this.checkoutSession.handleCommitsListRequest(msg);
+        return this.checkoutSession.handleCommitsListRequest(msg, workspaceAuthority);
       case "checkout.commits.file_diff.request":
-        return this.checkoutSession.handleCommitFileDiffRequest(msg);
+        return this.checkoutSession.handleCommitFileDiffRequest(msg, workspaceAuthority);
       case "validate_branch_request":
         return this.checkoutSession.handleValidateBranchRequest(msg);
       case "branch_suggestions_request":
@@ -2301,7 +2313,7 @@ export class Session {
       case "directory_suggestions_request":
         return this.handleDirectorySuggestionsRequest(msg);
       case "subscribe_checkout_diff_request":
-        return this.checkoutSession.handleSubscribeDiffRequest(msg);
+        return this.checkoutSession.handleSubscribeDiffRequest(msg, workspaceAuthority);
       case "unsubscribe_checkout_diff_request":
         this.checkoutSession.handleUnsubscribeDiffRequest(msg);
         return undefined;
@@ -2320,7 +2332,7 @@ export class Session {
       case "checkout_push_request":
         return this.checkoutSession.handleCheckoutPushRequest(msg);
       case "checkout.refresh.request":
-        return this.checkoutSession.handleRefreshRequest(msg);
+        return this.checkoutSession.handleRefreshRequest(msg, workspaceAuthority);
       case "checkout.discard_changes.request":
         return this.checkoutSession.handleCheckoutDiscardChangesRequest(msg);
       case "checkout_pr_create_request":
@@ -2402,12 +2414,17 @@ export class Session {
   private dispatchWorkspaceFileMessage(
     msg: SessionInboundMessage,
     source?: object,
+    workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null,
   ): Promise<void> | undefined {
     switch (msg.type) {
       case "file_explorer_request":
-        return this.workspaceFilesSession.handleFileExplorerRequest(msg, source);
+        return this.workspaceFilesSession.handleFileExplorerRequest(
+          msg,
+          source,
+          workspaceAuthority,
+        );
       case "fs.file.subscribe.request":
-        return this.workspaceFilesSession.handleFileSubscribeRequest(msg);
+        return this.workspaceFilesSession.handleFileSubscribeRequest(msg, workspaceAuthority);
       case "fs.file.unsubscribe.request":
         this.workspaceFilesSession.handleFileUnsubscribeRequest(msg);
         return undefined;

@@ -152,7 +152,7 @@ describe("daemon bearer auth", () => {
     }
   });
 
-  test("keeps health and a valid authentication responsive during a bounded invalid burst", async () => {
+  test("bounds invalid HTTP auth while health and valid HTTP and WebSocket auth stay responsive", async () => {
     const daemonHandle = await createTestPaseoDaemon({
       auth: { password: CORRECT_PASSWORD_HASH },
     });
@@ -165,19 +165,13 @@ describe("daemon bearer auth", () => {
         sockets.push(ws);
         return ws;
       });
-      const invalidConnections = Array.from({ length: 12 }, (_, index) =>
-        connectWebSocket({
-          port: daemonHandle.port,
-          protocol: `paseo.bearer.wrong-password-${index}`,
-        }).then(
-          ({ ws }) =>
-            new Promise<{ code: number; reason: string }>((resolve) => {
-              sockets.push(ws);
-              ws.once("close", (code, reason) => {
-                resolve({ code, reason: reason.toString() });
-              });
-            }),
-        ),
+      const validHttp = fetch(`http://127.0.0.1:${daemonHandle.port}/api/status`, {
+        headers: { Authorization: "Bearer correct-password" },
+      });
+      const invalidHttp = Array.from({ length: 12 }, (_, index) =>
+        fetch(`http://127.0.0.1:${daemonHandle.port}/api/status`, {
+          headers: { Authorization: `Bearer wrong-password-${index}` },
+        }),
       );
 
       const health = await Promise.race([
@@ -190,15 +184,14 @@ describe("daemon bearer auth", () => {
         ),
       ]);
       expect(health.status).toBe(200);
-      const valid = await validConnection;
-      const rejected = await Promise.all(invalidConnections);
+      const [valid, validResponse, rejected] = await Promise.all([
+        validConnection,
+        validHttp,
+        Promise.all(invalidHttp),
+      ]);
+      expect(validResponse.status).toBe(200);
       expect(rejected).toHaveLength(12);
-      expect(rejected.every(({ code }) => code === 4401)).toBe(true);
-      expect(
-        rejected.every(({ reason }) =>
-          ["Incorrect password", "Too many authentication attempts"].includes(reason),
-        ),
-      ).toBe(true);
+      expect(rejected.every(({ status }) => status === 401)).toBe(true);
       expect(valid.readyState).toBe(WebSocket.OPEN);
     } finally {
       for (const socket of sockets) socket.close();

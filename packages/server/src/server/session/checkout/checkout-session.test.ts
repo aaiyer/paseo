@@ -1,8 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import pino from "pino";
 import {
   type CheckoutDiffSubscriber,
@@ -28,6 +36,7 @@ import {
 } from "../../test-utils/workspace-git-service-stub.js";
 import { expandTilde } from "../../../utils/path.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
+import { openMayaRestrictedWorkspaceAuthority } from "../../maya-restricted-mode.js";
 
 function isCheckDetailsResponse(msg: SessionOutboundMessage): boolean {
   return msg.type === "checkout.forge.get_check_details.response";
@@ -629,6 +638,50 @@ describe("CheckoutSession", () => {
 
       expect(subscriptions[0].unsubscribeCalls).toBe(1);
       expect(subscriptions[1].unsubscribeCalls).toBe(1);
+    });
+
+    it("cancels a restricted diff subscription before emitting after root replacement", async () => {
+      const root = mkdtempSync(join(tmpdir(), "checkout-authority-"));
+      const cwd = join(root, "workspace");
+      const displaced = join(root, "displaced");
+      mkdirSync(join(cwd, ".git"), { recursive: true });
+      const authority = await openMayaRestrictedWorkspaceAuthority(cwd);
+      const { subscriber, subscriptions } = createFakeDiffSubscriber({
+        cwd,
+        files: [],
+        error: null,
+      });
+      const { checkout, emitted } = makeCheckoutSession({ diff: subscriber });
+
+      try {
+        await checkout.handleSubscribeDiffRequest(
+          {
+            type: "subscribe_checkout_diff_request",
+            subscriptionId: "restricted",
+            cwd,
+            compare: { mode: "uncommitted" },
+            requestId: "restricted-open",
+          },
+          authority,
+        );
+        await authority.release();
+        renameSync(cwd, displaced);
+        mkdirSync(join(cwd, ".git"), { recursive: true });
+
+        subscriptions[0].emit({
+          cwd,
+          files: [{ path: "replacement.txt", additions: 1, deletions: 0, status: "modified" }],
+          error: null,
+        });
+
+        await vi.waitFor(() => expect(subscriptions[0].unsubscribeCalls).toBe(1));
+        expect(emitted).toHaveLength(1);
+        expect(emitted[0].type).toBe("subscribe_checkout_diff_response");
+      } finally {
+        checkout.cleanup();
+        await authority.release();
+        rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 

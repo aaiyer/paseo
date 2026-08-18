@@ -198,6 +198,7 @@ import {
 import { terminateWithTreeKill } from "../utils/tree-kill.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
+  BoundedDaemonPasswordVerifier,
   createRequireBearerMiddleware,
   isAgentMcpRequestAuthorized,
   type DaemonAuthConfig,
@@ -634,6 +635,7 @@ export async function createPaseoDaemon(
   const listenTarget = parseListenString(config.listen);
 
   const app = express();
+  const passwordVerifier = new BoundedDaemonPasswordVerifier();
   app.set("trust proxy", resolveExpressTrustProxySetting(config));
   daemonConfigStore.onFieldChange("trustedProxies", (value) => {
     app.set("trust proxy", value ?? ["loopback"]);
@@ -756,7 +758,7 @@ export async function createPaseoDaemon(
   mountWebUi(app, config, logger);
 
   app.use(
-    createRequireBearerMiddleware(config.auth, (context) => {
+    createRequireBearerMiddleware(config.auth, passwordVerifier, (context) => {
       logger.warn(context, "Rejected HTTP request with invalid daemon password");
     }),
   );
@@ -1416,6 +1418,8 @@ export async function createPaseoDaemon(
           password: config.auth?.password,
           capabilityToken: agentMcpAuthToken,
           authorizationHeader: req.header("authorization"),
+          verifier: passwordVerifier,
+          peer: req.socket.remoteAddress ?? "unknown",
         }))
       ) {
         res.status(401).json({ error: "Unauthorized" });
@@ -1644,6 +1648,7 @@ export async function createPaseoDaemon(
               workspaceSetupRuntime,
               pluginRuntime,
               orchestrationSkills,
+              passwordVerifier,
             );
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
@@ -1690,6 +1695,7 @@ export async function createPaseoDaemon(
       speechService.start();
       scriptHealthMonitor.start();
     } catch (error) {
+      passwordVerifier.dispose();
       await pluginRuntime.stopAllPlugins().catch(() => undefined);
       await serviceProxy.stopStandalone().catch(() => undefined);
       if (mainStarted) {
@@ -1720,6 +1726,7 @@ export async function createPaseoDaemon(
     if (wsServer) {
       await wsServer.close();
     }
+    passwordVerifier.dispose();
     await serviceProxy.stopStandalone();
     // Force-drop remaining sockets so httpServer.close() resolves promptly.
     // We've already closed wsServer (which sent ws-layer close frames) and
