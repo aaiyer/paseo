@@ -15,6 +15,7 @@ import {
   WorkspaceGitServiceImpl,
   type WorkspaceGitRuntimeSnapshot,
 } from "./workspace-git-service.js";
+import { registerMayaRestrictedWorkspaceAuthorityBinding } from "./maya-restricted-workspace-authority-registry.js";
 
 const REPO_CWD = path.resolve("/tmp/repo");
 
@@ -332,6 +333,62 @@ describe("WorkspaceGitServiceImpl", () => {
     vi.useRealTimers();
   });
 
+  test("does not reuse a released authority snapshot when an fd pathname is reassigned", async () => {
+    const reusedFdPath = path.resolve("/proc/self/fd/42");
+    let selectedBranch = "workspace-a";
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { currentBranch: selectedBranch }),
+    );
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => ({
+      ...createCheckoutSnapshotFacts(cwd),
+      currentBranch: selectedBranch,
+    }));
+    const service = createService({
+      getCheckoutStatus,
+      getCheckoutSnapshotFacts,
+    });
+    const binding = (cacheKey: string) => ({
+      cacheKey,
+      gitLaunchContext: null,
+      validateGitAssociation: async () => undefined,
+    });
+    const unregisterA = registerMayaRestrictedWorkspaceAuthorityBinding(
+      reusedFdPath,
+      binding("authority-a"),
+    );
+
+    try {
+      const listener = vi.fn();
+      const subscription = service.registerWorkspace({ cwd: reusedFdPath }, listener);
+      const first = await service.getSnapshot(reusedFdPath, {
+        force: true,
+        reason: "authority-a",
+      });
+      expect(first.git.currentBranch).toBe("workspace-a");
+      subscription.unsubscribe();
+      unregisterA();
+
+      selectedBranch = "workspace-b";
+      const unregisterB = registerMayaRestrictedWorkspaceAuthorityBinding(
+        reusedFdPath,
+        binding("authority-b"),
+      );
+      try {
+        const secondSubscription = service.registerWorkspace({ cwd: reusedFdPath }, vi.fn());
+        const second = await service.getSnapshot(reusedFdPath);
+        expect(second.git.currentBranch).toBe("workspace-b");
+        expect(second).not.toBe(first);
+        expect(getCheckoutStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
+        secondSubscription.unsubscribe();
+      } finally {
+        unregisterB();
+      }
+    } finally {
+      unregisterA();
+      await service.dispose();
+    }
+  });
+
   test("registerWorkspace returns a subscription without an initial snapshot contract", async () => {
     const service = createService();
 
@@ -363,7 +420,10 @@ describe("WorkspaceGitServiceImpl", () => {
     expect(snapshotListener).toHaveBeenCalledWith(createSnapshot(REPO_CWD));
 
     snapshotSubscription.unsubscribe();
-    await service.getSnapshot(REPO_CWD, { force: true, reason: "after-unsubscribe" });
+    await service.getSnapshot(REPO_CWD, {
+      force: true,
+      reason: "after-unsubscribe",
+    });
 
     expect(snapshotListener).toHaveBeenCalledTimes(1);
 
@@ -420,7 +480,9 @@ describe("WorkspaceGitServiceImpl", () => {
 
     const service = createService({
       getCheckoutStatus: vi.fn(async (cwd: string) =>
-        createCheckoutStatus(cwd, { remoteUrl: "https://gitlab.com/acme/repo.git" }),
+        createCheckoutStatus(cwd, {
+          remoteUrl: "https://gitlab.com/acme/repo.git",
+        }),
       ),
       getPullRequestStatus,
       forgeOverrides: { gitlab: gitlabStub },
@@ -701,7 +763,11 @@ describe("WorkspaceGitServiceImpl", () => {
       exitCode: 0,
       signal: null,
     }));
-    const service = createService({ getCheckoutStatus, subscribe, runGitCommand });
+    const service = createService({
+      getCheckoutStatus,
+      subscribe,
+      runGitCommand,
+    });
 
     cwds.forEach((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
     await vi.waitFor(() => {
@@ -860,7 +926,14 @@ describe("WorkspaceGitServiceImpl", () => {
     const runGitFetch = vi.fn(async () => {
       await firstFetch.promise;
       return {
-        changes: [{ kind: "moved" as const, ref: "origin/main", beforeOid: "a", afterOid: "b" }],
+        changes: [
+          {
+            kind: "moved" as const,
+            ref: "origin/main",
+            beforeOid: "a",
+            afterOid: "b",
+          },
+        ],
         error: null,
       };
     });
@@ -1051,7 +1124,14 @@ describe("WorkspaceGitServiceImpl", () => {
       runGitFetch: vi.fn(async () => {
         await releaseFetch.promise;
         return {
-          changes: [{ kind: "moved" as const, ref: "origin/main", beforeOid: "a", afterOid: "b" }],
+          changes: [
+            {
+              kind: "moved" as const,
+              ref: "origin/main",
+              beforeOid: "a",
+              afterOid: "b",
+            },
+          ],
           error: null,
         };
       }),
@@ -1070,7 +1150,10 @@ describe("WorkspaceGitServiceImpl", () => {
       expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2);
       expect(getCheckoutShortstat).toHaveBeenCalledTimes(2);
     });
-    expect(listener.mock.lastCall?.[0].git.diffStat).toEqual({ additions: 2, deletions: 0 });
+    expect(listener.mock.lastCall?.[0].git.diffStat).toEqual({
+      additions: 2,
+      deletions: 0,
+    });
 
     subscription.unsubscribe();
     service.dispose();
@@ -1389,7 +1472,10 @@ describe("WorkspaceGitServiceImpl", () => {
       expect(service.getMetrics().repositoryWorkspaceLinkCount).toBe(1);
     });
 
-    expect(initialSnapshot.git.diffStat).toEqual({ additions: 1, deletions: 0 });
+    expect(initialSnapshot.git.diffStat).toEqual({
+      additions: 1,
+      deletions: 0,
+    });
     const repoRootWatch = watchCallbacks.find((entry) => entry.path === REPO_CWD);
     expect(repoRootWatch).toBeDefined();
 
@@ -1429,7 +1515,9 @@ describe("WorkspaceGitServiceImpl", () => {
     }
     expect(getCheckoutDiff).toHaveBeenCalledTimes(CACHE_MAX + OVERFLOW);
 
-    await service.getCheckoutDiff(`/tmp/repo-${CACHE_MAX - 1}`, { mode: "uncommitted" });
+    await service.getCheckoutDiff(`/tmp/repo-${CACHE_MAX - 1}`, {
+      mode: "uncommitted",
+    });
     expect(getCheckoutDiff).toHaveBeenCalledTimes(CACHE_MAX + OVERFLOW);
 
     await service.getCheckoutDiff("/tmp/repo-0", { mode: "uncommitted" });

@@ -4,6 +4,7 @@ import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import type { SessionInboundMessage } from "./messages.js";
+import { registerMayaRestrictedWorkspaceAuthorityBinding } from "./maya-restricted-workspace-authority-registry.js";
 import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 
 export const MAYA_RESTRICTED_ALLOWED_SESSION_MESSAGE_TYPES = [
@@ -59,6 +60,8 @@ const ALLOWED = { allowed: true, reason: "allowed" } as const;
 const MAYA_WORKSPACE_IDENTITY_DOMAIN = "maya-paseo-workspace-identity-v1";
 const MAX_GIT_LINK_BYTES = 4096;
 const OPEN_DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const OPEN_FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW;
+let nextAuthorityCacheId = 1;
 
 export interface MayaRestrictedWorkspaceAuthority {
   readonly cwd: string;
@@ -71,14 +74,32 @@ export interface MayaRestrictedWorkspaceAuthority {
 
 class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAuthority {
   private references = 1;
+  private unregisterBinding: (() => void) | null = null;
 
   constructor(
     readonly cwd: string,
     readonly workspaceId: string,
     readonly rootAccessPath: string,
     private readonly rootHandle: FileHandle,
+    private readonly dotGitHandle: FileHandle | null,
+    private readonly gitDirectoryHandle: FileHandle,
     private readonly commonDirectoryHandle: FileHandle,
   ) {}
+
+  activateBinding(): void {
+    if (this.unregisterBinding) throw new Error("workspace authority is already active");
+    const cacheId = nextAuthorityCacheId;
+    nextAuthorityCacheId += 1;
+    this.unregisterBinding = registerMayaRestrictedWorkspaceAuthorityBinding(this.rootAccessPath, {
+      cacheKey: `maya-restricted:${this.workspaceId}:${cacheId}`,
+      gitLaunchContext: {
+        rootHandle: this.rootHandle,
+        gitDirectoryHandle: this.gitDirectoryHandle,
+        commonDirectoryHandle: this.commonDirectoryHandle,
+      },
+      validateGitAssociation: () => this.validateGitAssociation(),
+    });
+  }
 
   retain(): MayaRestrictedWorkspaceAuthority {
     if (this.references === 0) throw new Error("workspace authority is closed");
@@ -90,7 +111,14 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
     if (this.references === 0) return;
     this.references -= 1;
     if (this.references !== 0) return;
-    await Promise.allSettled([this.rootHandle.close(), this.commonDirectoryHandle.close()]);
+    this.unregisterBinding?.();
+    this.unregisterBinding = null;
+    await closeUniqueHandles([
+      this.rootHandle,
+      this.dotGitHandle,
+      this.gitDirectoryHandle,
+      this.commonDirectoryHandle,
+    ]);
   }
 
   async isCurrent(): Promise<boolean> {
@@ -104,6 +132,130 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
     } catch {
       return false;
     }
+  }
+
+  async validateGitAssociation(): Promise<void> {
+    const currentRoot = await fs.realpath(this.cwd);
+    const [boundRoot, currentRootMetadata, boundRootMetadata] = await Promise.all([
+      fs.realpath(this.rootAccessPath),
+      fs.lstat(currentRoot, { bigint: true }),
+      this.rootHandle.stat({ bigint: true }),
+    ]);
+    if (
+      currentRoot !== this.cwd ||
+      boundRoot !== this.cwd ||
+      !sameFile(currentRootMetadata, boundRootMetadata)
+    ) {
+      throw new Error("workspace root association changed");
+    }
+
+    const currentDotGit = path.join(this.cwd, ".git");
+    const currentDotGitMetadata = await fs.lstat(currentDotGit, {
+      bigint: true,
+    });
+    const gitDirectoryAccessPath = `/proc/self/fd/${this.gitDirectoryHandle.fd}`;
+    const boundGitDirectoryMetadata = await this.gitDirectoryHandle.stat({
+      bigint: true,
+    });
+    if (this.dotGitHandle === null) {
+      if (
+        !currentDotGitMetadata.isDirectory() ||
+        !sameFile(currentDotGitMetadata, boundGitDirectoryMetadata)
+      ) {
+        throw new Error("workspace Git directory association changed");
+      }
+    } else {
+      const boundDotGitMetadata = await this.dotGitHandle.stat({
+        bigint: true,
+      });
+      if (
+        !currentDotGitMetadata.isFile() ||
+        !sameFile(currentDotGitMetadata, boundDotGitMetadata)
+      ) {
+        throw new Error("workspace .git association changed");
+      }
+      const selectedGitDirectory = await readBoundedGitPathHandle(
+        this.dotGitHandle,
+        "gitdir: ",
+        this.rootAccessPath,
+      );
+      await requireDirectoryIdentity(selectedGitDirectory, boundGitDirectoryMetadata);
+
+      const backpointerHandle = await fs.open(
+        path.join(gitDirectoryAccessPath, "gitdir"),
+        OPEN_FILE_FLAGS,
+      );
+      try {
+        const selectedDotGit = await readBoundedGitPathHandle(
+          backpointerHandle,
+          "",
+          gitDirectoryAccessPath,
+        );
+        await requireFileIdentity(selectedDotGit, boundDotGitMetadata);
+      } finally {
+        await backpointerHandle.close();
+      }
+    }
+
+    const commonDirectoryMetadata = await this.commonDirectoryHandle.stat({
+      bigint: true,
+    });
+    const commondirPath = path.join(gitDirectoryAccessPath, "commondir");
+    try {
+      const commondirHandle = await fs.open(commondirPath, OPEN_FILE_FLAGS);
+      try {
+        const selectedCommonDirectory = await readBoundedGitPathHandle(
+          commondirHandle,
+          "",
+          gitDirectoryAccessPath,
+        );
+        await requireDirectoryIdentity(selectedCommonDirectory, commonDirectoryMetadata);
+      } finally {
+        await commondirHandle.close();
+      }
+    } catch (error) {
+      if (this.dotGitHandle !== null || (error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      if (!sameFile(boundGitDirectoryMetadata, commonDirectoryMetadata)) {
+        throw new Error("main worktree common directory association changed");
+      }
+    }
+  }
+}
+
+function sameFile(
+  left: { dev: bigint; ino: bigint },
+  right: { dev: bigint; ino: bigint },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function closeUniqueHandles(handles: Array<FileHandle | null>): Promise<void> {
+  const unique = new Map<number, FileHandle>();
+  for (const handle of handles) {
+    if (handle) unique.set(handle.fd, handle);
+  }
+  await Promise.allSettled([...unique.values()].map((handle) => handle.close()));
+}
+
+async function requireDirectoryIdentity(
+  directory: string,
+  expected: { dev: bigint; ino: bigint },
+): Promise<void> {
+  const metadata = await fs.lstat(directory, { bigint: true });
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameFile(metadata, expected)) {
+    throw new Error("Git directory identity changed");
+  }
+}
+
+async function requireFileIdentity(
+  file: string,
+  expected: { dev: bigint; ino: bigint },
+): Promise<void> {
+  const metadata = await fs.lstat(file, { bigint: true });
+  if (!metadata.isFile() || metadata.isSymbolicLink() || !sameFile(metadata, expected)) {
+    throw new Error("Git file identity changed");
   }
 }
 
@@ -169,6 +321,8 @@ export async function openMayaRestrictedWorkspaceAuthority(
   if (process.platform !== "linux") throw new Error("Maya restricted mode requires Linux");
   const expectedRoot = path.resolve(cwd);
   const rootHandle = await fs.open(expectedRoot, OPEN_DIRECTORY_FLAGS);
+  let dotGitHandle: FileHandle | null = null;
+  let gitDirectoryHandle: FileHandle | null = null;
   let commonDirectoryHandle: FileHandle | null = null;
   try {
     const rootAccessPath = `/proc/self/fd/${rootHandle.fd}`;
@@ -184,25 +338,32 @@ export async function openMayaRestrictedWorkspaceAuthority(
     const dotGitMetadata = await fs.lstat(dotGit, { bigint: true });
     let commonDirectory: string;
     if (dotGitMetadata.isDirectory() && !dotGitMetadata.isSymbolicLink()) {
-      commonDirectory = dotGit;
+      gitDirectoryHandle = await fs.open(dotGit, OPEN_DIRECTORY_FLAGS);
+      commonDirectory = `/proc/self/fd/${gitDirectoryHandle.fd}`;
+      commonDirectoryHandle = gitDirectoryHandle;
     } else if (dotGitMetadata.isFile() && !dotGitMetadata.isSymbolicLink()) {
-      const gitDirectory = await readBoundedGitPathFile(dotGit, "gitdir: ", rootAccessPath);
-      const gitDirectoryHandle = await fs.open(gitDirectory, OPEN_DIRECTORY_FLAGS);
+      dotGitHandle = await fs.open(dotGit, OPEN_FILE_FLAGS);
+      const gitDirectory = await readBoundedGitPathHandle(dotGitHandle, "gitdir: ", rootAccessPath);
+      gitDirectoryHandle = await fs.open(gitDirectory, OPEN_DIRECTORY_FLAGS);
+      const gitDirectoryAccessPath = `/proc/self/fd/${gitDirectoryHandle.fd}`;
+      const commondirHandle = await fs.open(
+        path.join(gitDirectoryAccessPath, "commondir"),
+        OPEN_FILE_FLAGS,
+      );
       try {
-        const gitDirectoryAccessPath = `/proc/self/fd/${gitDirectoryHandle.fd}`;
-        commonDirectory = await readBoundedGitPathFile(
-          path.join(gitDirectoryAccessPath, "commondir"),
+        commonDirectory = await readBoundedGitPathHandle(
+          commondirHandle,
           "",
           gitDirectoryAccessPath,
         );
       } finally {
-        await gitDirectoryHandle.close();
+        await commondirHandle.close();
       }
     } else {
       throw new Error("workspace .git entry is unsafe");
     }
 
-    commonDirectoryHandle = await fs.open(commonDirectory, OPEN_DIRECTORY_FLAGS);
+    commonDirectoryHandle ??= await fs.open(commonDirectory, OPEN_DIRECTORY_FLAGS);
     const commonDirectoryAccessPath = `/proc/self/fd/${commonDirectoryHandle.fd}`;
     const [canonicalCommonDirectory, commonMetadata, finalRoot, finalRootMetadata] =
       await Promise.all([
@@ -232,15 +393,21 @@ export async function openMayaRestrictedWorkspaceAuthority(
       digest.update(field);
       digest.update("\0");
     }
-    return new OpenMayaRestrictedWorkspaceAuthority(
+    if (!gitDirectoryHandle) throw new Error("workspace Git directory is absent");
+    const authority = new OpenMayaRestrictedWorkspaceAuthority(
       root,
       `wks_${digest.digest("hex").slice(0, 16)}`,
       rootAccessPath,
       rootHandle,
+      dotGitHandle,
+      gitDirectoryHandle,
       commonDirectoryHandle,
     );
+    await authority.validateGitAssociation();
+    authority.activateBinding();
+    return authority;
   } catch (error) {
-    await Promise.allSettled([rootHandle.close(), commonDirectoryHandle?.close()]);
+    await closeUniqueHandles([rootHandle, dotGitHandle, gitDirectoryHandle, commonDirectoryHandle]);
     throw error;
   }
 }
@@ -255,12 +422,12 @@ export async function deriveMayaRestrictedWorkspaceId(cwd: string): Promise<stri
   }
 }
 
-async function readBoundedGitPathFile(
-  filePath: string,
+async function readBoundedGitPathHandle(
+  handle: FileHandle,
   prefix: string,
   relativeTo: string,
 ): Promise<string> {
-  const metadata = await fs.lstat(filePath, { bigint: true });
+  const metadata = await handle.stat({ bigint: true });
   if (
     !metadata.isFile() ||
     metadata.isSymbolicLink() ||
@@ -269,13 +436,17 @@ async function readBoundedGitPathFile(
   ) {
     throw new Error("Git path indirection is unsafe");
   }
-  const raw = await fs.readFile(filePath, "utf8");
+  const bytes = Buffer.alloc(Number(metadata.size));
+  const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+  if (bytesRead !== bytes.length) throw new Error("Git path indirection changed while reading");
+  const raw = bytes.toString("utf8");
   if (raw.includes("\0")) throw new Error("Git path indirection is malformed");
   const value = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
   if (value.includes("\n") || !value.startsWith(prefix) || value.length === prefix.length) {
     throw new Error("Git path indirection is malformed");
   }
-  return fs.realpath(path.resolve(relativeTo, value.slice(prefix.length)));
+  const target = value.slice(prefix.length);
+  return fs.realpath(path.isAbsolute(target) ? target : `${relativeTo}/${target}`);
 }
 
 export async function acquireMayaRestrictedWorkspaceReadAuthority(

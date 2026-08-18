@@ -3,6 +3,10 @@ import { existsSync } from "node:fs";
 import type { Logger } from "pino";
 import type { ProcessEnvRecord } from "../server/paseo-env.js";
 import {
+  resolveMayaRestrictedWorkspaceAuthorityBinding,
+  type MayaRestrictedGitLaunchContext,
+} from "../server/maya-restricted-workspace-authority-registry.js";
+import {
   GitCommandRuntimeMetricsWindow,
   type GitCommandRuntimeMetricsSnapshot,
 } from "./git-command-runtime-metrics.js";
@@ -23,10 +27,27 @@ import {
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
+const MAYA_ROOT_CHILD_FD = 3;
+const MAYA_GIT_DIRECTORY_CHILD_FD = 4;
+const MAYA_COMMON_DIRECTORY_CHILD_FD = 5;
 
 let gitProcessScheduler = new GitProcessScheduler(resolveGitProcessPolicy({ env: process.env }));
 let gitRuntimeMetrics = createGitCommandRuntimeMetricsWindow(gitProcessScheduler.policy);
 const gitCommandPriority = new AsyncLocalStorage<GitProcessPriority>();
+let afterMayaAuthorityValidationForTest: (() => Promise<void>) | null = null;
+
+export function installAfterMayaAuthorityValidationHookForTest(
+  hook: () => Promise<void>,
+): () => void {
+  if (process.env.NODE_ENV !== "test") throw new Error("Git authority hook is test-only");
+  if (afterMayaAuthorityValidationForTest) throw new Error("Git authority hook already installed");
+  afterMayaAuthorityValidationForTest = hook;
+  return () => {
+    if (afterMayaAuthorityValidationForTest === hook) {
+      afterMayaAuthorityValidationForTest = null;
+    }
+  };
+}
 
 export function runWithGitCommandPriority<T>(priority: GitProcessPriority, operation: () => T): T {
   return gitCommandPriority.run(priority, operation);
@@ -253,6 +274,24 @@ export function runGitCommand(
   args: string[],
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
+  const authority = resolveMayaRestrictedWorkspaceAuthorityBinding(options.cwd);
+  if (!authority) return runGitCommandWithBoundOptions(args, options);
+  return authority.validateGitAssociation().then(async () => {
+    const hook = afterMayaAuthorityValidationForTest;
+    afterMayaAuthorityValidationForTest = null;
+    await hook?.();
+    if (!authority.gitLaunchContext) {
+      throw new Error("Maya restricted Git launch context is absent");
+    }
+    return runGitCommandWithBoundOptions(args, options, authority.gitLaunchContext);
+  });
+}
+
+function runGitCommandWithBoundOptions(
+  args: string[],
+  options: GitCommandOptions,
+  mayaLaunchContext?: MayaRestrictedGitLaunchContext,
+): Promise<GitCommandResult> {
   const metricsState = submitGitCommandMetric(args, options.cwd);
   const commandTrace = submitGitCommandTrace(args, options.cwd, {
     active: gitProcessScheduler.activeCount,
@@ -274,7 +313,17 @@ export function runGitCommand(
       const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
       const acceptExitCodes = options.acceptExitCodes ?? [0];
       const command = formatGitCommand(args);
-      const envOverlay = mergeEnvOverlays(options.env, options.envOverlay);
+      const mayaGitEnvironment: ProcessEnvRecord | undefined = mayaLaunchContext
+        ? {
+            GIT_WORK_TREE: `/proc/self/fd/${MAYA_ROOT_CHILD_FD}`,
+            GIT_DIR: `/proc/self/fd/${MAYA_GIT_DIRECTORY_CHILD_FD}`,
+            GIT_COMMON_DIR: `/proc/self/fd/${MAYA_COMMON_DIRECTORY_CHILD_FD}`,
+          }
+        : undefined;
+      const envOverlay = mergeEnvOverlays(
+        mergeEnvOverlays(options.env, options.envOverlay),
+        mayaGitEnvironment,
+      );
       const startedAt = Date.now();
       beginGitCommandMetric(metricsState);
       const logger = typeof options.logger?.trace === "function" ? options.logger : undefined;
@@ -298,7 +347,10 @@ export function runGitCommand(
       let settled = false;
       let metricFinished = false;
       let processError: Error | null = null;
-      let processExit: { exitCode: number | null; signal: NodeJS.Signals | null } | null = null;
+      let processExit: {
+        exitCode: number | null;
+        signal: NodeJS.Signals | null;
+      } | null = null;
       let timeoutError: Error | null = null;
       let truncated = false;
       let stdoutBytes = 0;
@@ -318,7 +370,10 @@ export function runGitCommand(
         if (metricFinished) return;
         metricFinished = true;
         finishGitCommandMetric(metricsState, metric);
-        gitRuntimeMetrics.finish(runtimeMetric, { success: metric.success, timedOut });
+        gitRuntimeMetrics.finish(runtimeMetric, {
+          success: metric.success,
+          timedOut,
+        });
       };
 
       const settleTimeoutTrace = (exitCode: number | null, signal: NodeJS.Signals | null) => {
@@ -368,10 +423,19 @@ export function runGitCommand(
         // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
         // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
         child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
-          cwd: options.cwd,
+          cwd: mayaLaunchContext ? `/proc/self/fd/${mayaLaunchContext.rootHandle.fd}` : options.cwd,
           envOverlay,
           shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: mayaLaunchContext
+            ? [
+                "ignore",
+                "pipe",
+                "pipe",
+                mayaLaunchContext.rootHandle.fd,
+                mayaLaunchContext.gitDirectoryHandle.fd,
+                mayaLaunchContext.commonDirectoryHandle.fd,
+              ]
+            : ["ignore", "pipe", "pipe"],
         });
         spawnGitCommandTrace(commandTrace, child.pid);
       } catch (error) {
@@ -504,7 +568,9 @@ export function runGitCommand(
           settle(() =>
             reject(
               new Error(
-                `Git command failed: ${command}${truncationNote} (exit code: ${String(exitCode)}, signal: ${signal ?? "none"})\n${stderrPreview}`,
+                `Git command failed: ${command}${truncationNote} (exit code: ${String(
+                  exitCode,
+                )}, signal: ${signal ?? "none"})\n${stderrPreview}`,
               ),
             ),
           );

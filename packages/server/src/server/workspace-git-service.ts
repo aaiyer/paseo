@@ -69,6 +69,10 @@ import {
 } from "./file-observer/index.js";
 import { checkoutLiteFromGitSnapshot } from "./workspace-registry-model.js";
 import { createWatcherLivenessCanary } from "./watcher-liveness-canary.js";
+import {
+  onMayaRestrictedWorkspaceAuthorityReleased,
+  resolveMayaRestrictedWorkspaceAuthorityBinding,
+} from "./maya-restricted-workspace-authority-registry.js";
 
 const WORKSPACE_GIT_WATCH_DEBOUNCE_MS = 1_000;
 const BACKGROUND_GIT_FETCH_INTERVAL_MS = 180_000;
@@ -388,6 +392,7 @@ class WorkspaceGitWatcherSubscriptionTimeoutError extends Error {
 }
 
 interface WorkspaceGitTarget {
+  key: string;
   cwd: string;
   listeners: Set<WorkspaceGitListener>;
   workingTreeWatchTarget: WorkingTreeWatchTarget | null;
@@ -571,6 +576,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     WorkspaceGitAuxiliaryReadCacheEntry<CheckoutDiffResult>
   >({ max: WORKSPACE_GIT_CHECKOUT_DIFF_CACHE_MAX });
   private watcherErrorCallbackCount = 0;
+  private readonly unsubscribeMayaAuthorityRelease: () => void;
   constructor(options: WorkspaceGitServiceOptions) {
     this.logger = options.logger.child({ module: "workspace-git-service" });
     this.paseoHome = options.paseoHome;
@@ -583,6 +589,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.forgeResolver = createForgeResolver({
       createService: (forge) => this.deps.forgeOverrides?.[forge] ?? createForgeService(forge),
     });
+    this.unsubscribeMayaAuthorityRelease = onMayaRestrictedWorkspaceAuthorityReleased(
+      (cacheKey) => {
+        const target = this.workspaceTargets.get(cacheKey);
+        if (target) this.removeWorkspaceTarget(target);
+      },
+    );
   }
 
   resolveForge(cwd: string): Promise<ForgeResolution | null> {
@@ -595,8 +607,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     listener: WorkspaceGitListener,
   ): WorkspaceGitSubscription {
     this.assertNotDisposed();
-    const cwd = resolve(params.cwd);
-    const target = this.ensureWorkspaceTarget(cwd);
+    const { cwd, key } = this.resolveWorkspaceTargetLocation(params.cwd);
+    const target = this.ensureWorkspaceTarget(cwd, key);
     target.listeners.add(listener);
     if (target.listeners.size === 1) {
       this.startWorkspaceSubscriptionTimers(target);
@@ -608,7 +620,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     return {
       unsubscribe: () => {
-        this.removeWorkspaceListener(cwd, listener);
+        this.removeWorkspaceListener(key, listener);
       },
     };
   }
@@ -683,9 +695,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options?: WorkspaceGitSnapshotOptions,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
     this.assertNotDisposed();
-    cwd = resolve(cwd);
+    const location = this.resolveWorkspaceTargetLocation(cwd);
     const request = this.normalizeRefreshRequest(options, "getSnapshot", true);
-    const target = this.ensureWorkspaceTarget(cwd);
+    const target = this.ensureWorkspaceTarget(location.cwd, location.key);
     if (!request.force && target.latestSnapshot) {
       return target.latestSnapshot;
     }
@@ -722,8 +734,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   peekSnapshot(cwd: string): WorkspaceGitRuntimeSnapshot | null {
-    cwd = resolve(cwd);
-    return this.workspaceTargets.get(cwd)?.latestSnapshot ?? null;
+    const { key } = this.resolveWorkspaceTargetLocation(cwd);
+    return this.workspaceTargets.get(key)?.latestSnapshot ?? null;
   }
 
   getCheckoutDiff(
@@ -733,8 +745,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   ): Promise<CheckoutDiffResult> {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
+    const cacheCwd =
+      resolveMayaRestrictedWorkspaceAuthorityBinding(normalizedCwd)?.cacheKey ?? normalizedCwd;
     const normalizedOptions = this.normalizeCheckoutDiffOptions(options);
-    const key = this.buildCheckoutDiffCacheKey(normalizedCwd, normalizedOptions);
+    const key = this.buildCheckoutDiffCacheKey(cacheCwd, normalizedOptions);
     return this.readAuxiliaryCache(this.checkoutDiffCache, key, readOptions, () =>
       this.deps.getCheckoutDiff(normalizedCwd, normalizedOptions, {
         paseoHome: this.paseoHome,
@@ -897,8 +911,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   async refresh(cwd: string, _options?: { priority?: "normal" | "high" }): Promise<void> {
     this.assertNotDisposed();
-    cwd = resolve(cwd);
-    const target = this.ensureWorkspaceTarget(cwd);
+    const location = this.resolveWorkspaceTargetLocation(cwd);
+    const target = this.ensureWorkspaceTarget(location.cwd, location.key);
     await this.refreshWorkspaceTarget(target, {
       force: false,
       refreshStructure: true,
@@ -931,8 +945,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   scheduleRefreshForCwd(cwd: string): void {
     this.assertNotDisposed();
-    cwd = resolve(cwd);
-    const target = this.workspaceTargets.get(cwd);
+    const { key } = this.resolveWorkspaceTargetLocation(cwd);
+    const target = this.workspaceTargets.get(key);
     if (target) {
       this.scheduleWorkspaceRefresh(target, { queueIfBusy: false });
     }
@@ -940,8 +954,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   onWorkspaceStateMayHaveChanged(cwd: string): void {
     this.assertNotDisposed();
-    const normalizedCwd = resolve(cwd);
-    const target = this.workspaceTargets.get(normalizedCwd);
+    const { cwd: normalizedCwd, key } = this.resolveWorkspaceTargetLocation(cwd);
+    const target = this.workspaceTargets.get(key);
     if (!target || target.closed) {
       return;
     }
@@ -966,6 +980,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
     this.disposed = true;
+    this.unsubscribeMayaAuthorityRelease();
     this.disposeController.abort(new WorkspaceGitServiceDisposedError());
     this.workspaceRefreshLimit.clearQueue();
     this.workspaceObservationSetupLimit.clearQueue();
@@ -998,14 +1013,25 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
   }
 
-  private ensureWorkspaceTarget(cwd: string): WorkspaceGitTarget {
+  private resolveWorkspaceTargetLocation(cwd: string): {
+    cwd: string;
+    key: string;
+  } {
+    const normalizedCwd = resolve(cwd);
+    return {
+      cwd: normalizedCwd,
+      key: resolveMayaRestrictedWorkspaceAuthorityBinding(normalizedCwd)?.cacheKey ?? normalizedCwd,
+    };
+  }
+
+  private ensureWorkspaceTarget(cwd: string, key = cwd): WorkspaceGitTarget {
     this.assertNotDisposed();
-    const existingTarget = this.workspaceTargets.get(cwd);
+    const existingTarget = this.workspaceTargets.get(key);
     if (existingTarget) {
       return existingTarget;
     }
 
-    return this.createWorkspaceTarget(cwd);
+    return this.createWorkspaceTarget(cwd, key);
   }
 
   private readAuxiliaryCache<T>(
@@ -1128,8 +1154,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workingTreeWatchAliases.set(cwd, target.cwd);
   }
 
-  private createWorkspaceTarget(cwd: string): WorkspaceGitTarget {
+  private createWorkspaceTarget(cwd: string, key: string): WorkspaceGitTarget {
     const target: WorkspaceGitTarget = {
+      key,
       cwd,
       listeners: new Set(),
       workingTreeWatchTarget: null,
@@ -1155,7 +1182,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       closed: false,
     };
 
-    this.workspaceTargets.set(cwd, target);
+    this.workspaceTargets.set(key, target);
     return target;
   }
 
@@ -1220,11 +1247,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     if (target.workingTreeWatchTarget !== workingTreeTarget) {
       if (target.workingTreeWatchTarget) {
-        this.removeWorkspaceWorkingTreeLink(target.workingTreeWatchTarget, target.cwd);
+        this.removeWorkspaceWorkingTreeLink(target.workingTreeWatchTarget, target.key);
       }
       target.workingTreeWatchTarget = workingTreeTarget;
     }
-    workingTreeTarget.workspaceKeys.add(target.cwd);
+    workingTreeTarget.workspaceKeys.add(target.key);
 
     if (!facts.isGit || !facts.absoluteGitDir) {
       target.observationSetupComplete = true;
@@ -1280,7 +1307,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return (
       !target.closed &&
       target.listeners.size > 0 &&
-      this.workspaceTargets.get(target.cwd) === target
+      this.workspaceTargets.get(target.key) === target
     );
   }
 
@@ -1580,7 +1607,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.closed || target.subscription) {
       return;
     }
-    const recovered = await this.startWorkingTreeSubscription(target, { replaceFallback: true });
+    const recovered = await this.startWorkingTreeSubscription(target, {
+      replaceFallback: true,
+    });
     if (!recovered) {
       this.scheduleWorkingTreeWatchRecovery(target);
       return;
@@ -1729,7 +1758,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     for (const workspaceKey of target.workspaceKeys) {
       const workspaceTarget = this.workspaceTargets.get(workspaceKey);
       if (workspaceTarget) {
-        this.scheduleWorkspaceRefresh(workspaceTarget, { scope: "worktree", reason });
+        this.scheduleWorkspaceRefresh(workspaceTarget, {
+          scope: "worktree",
+          reason,
+        });
       }
     }
   }
@@ -1774,14 +1806,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     const existingTarget = this.repoTargets.get(repoGitRoot);
     if (existingTarget) {
-      existingTarget.workspaceKeys.add(workspaceTarget.cwd);
+      existingTarget.workspaceKeys.add(workspaceTarget.key);
       return;
     }
 
     const repoTarget: RepoGitTarget = {
       repoGitRoot,
       cwd: workspaceTarget.cwd,
-      workspaceKeys: new Set([workspaceTarget.cwd]),
+      workspaceKeys: new Set([workspaceTarget.key]),
       subscription: null,
       fallbackPolling: false,
       fallbackPollTimer: null,
@@ -1976,7 +2008,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.closed || target.subscription) {
       return;
     }
-    const recovered = await this.startRepoMetadataObservation(target, { replaceFallback: true });
+    const recovered = await this.startRepoMetadataObservation(target, {
+      replaceFallback: true,
+    });
     if (!recovered) {
       this.scheduleRepoMetadataWatchRecovery(target);
       return;
@@ -2076,7 +2110,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           } else {
             target.recentFetchRemoteRefChanges.delete(effect.ref);
             if (target.knownRemoteRefs?.has(effect.ref)) {
-              this.routeRemoteBranchRef(target, effect.ref, refreshes, { narrow: true });
+              this.routeRemoteBranchRef(target, effect.ref, refreshes, {
+                narrow: true,
+              });
             } else if (
               event.type === "create" &&
               target.knownRemoteRefs &&
@@ -2338,9 +2374,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   ): void {
     const target =
       typeof targetOrCwd === "string"
-        ? this.workspaceTargets.get(resolve(targetOrCwd))
+        ? this.workspaceTargets.get(this.resolveWorkspaceTargetLocation(targetOrCwd).key)
         : targetOrCwd;
-    if (!target || target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+    if (!target || target.closed || this.workspaceTargets.get(target.key) !== target) {
       return;
     }
 
@@ -2355,7 +2391,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
 
     target.debounceTimer = setTimeout(() => {
-      if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+      if (target.closed || this.workspaceTargets.get(target.key) !== target) {
         return;
       }
       target.debounceTimer = null;
@@ -2616,7 +2652,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target: WorkspaceGitTarget,
     request: WorkspaceGitRefreshRequest,
   ): Promise<void> {
-    if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+    if (target.closed || this.workspaceTargets.get(target.key) !== target) {
       return;
     }
     try {
@@ -2782,7 +2818,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
       try {
         const admittedSnapshot = await this.workspaceRefreshLimit(() => {
-          if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+          if (target.closed || this.workspaceTargets.get(target.key) !== target) {
             return null;
           }
           return this.refreshSnapshot(target, request);
@@ -2801,7 +2837,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         failure = { error };
       }
 
-      if (this.disposed || target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+      if (this.disposed || target.closed || this.workspaceTargets.get(target.key) !== target) {
         break;
       }
 
@@ -2833,7 +2869,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           return this.combineSnapshot(target);
         } catch (error) {
           this.logger.debug(
-            { err: error, cwd: target.cwd, movedRemoteRefs: [...request.movedRemoteRefs] },
+            {
+              err: error,
+              cwd: target.cwd,
+              movedRemoteRefs: [...request.movedRemoteRefs],
+            },
             "Narrow remote ref refresh failed; using structural refresh",
           );
         }
@@ -2877,7 +2917,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       facts,
       { aheadBehind: latestGit.aheadBehind, diffStat: latestGit.diffStat },
       movedRemoteRefs,
-      { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot, logger: this.logger, facts },
+      {
+        paseoHome: this.paseoHome,
+        worktreesRoot: this.worktreesRoot,
+        logger: this.logger,
+        facts,
+      },
     );
     target.latestFacts = { ...facts, upstreamStatus: derived.upstreamStatus };
     target.latestGit = {
@@ -3058,7 +3103,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     github: WorkspaceGitRuntimeSnapshot["forge"],
     options?: { notify?: boolean },
   ): void {
-    if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+    if (target.closed || this.workspaceTargets.get(target.key) !== target) {
       return;
     }
 
@@ -3140,7 +3185,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       this.flushBufferedFetchMetadataEvents(target);
       if (result) {
         this.logger.warn(
-          { err: result.error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
+          {
+            err: result.error,
+            repoGitRoot: target.repoGitRoot,
+            cwd: target.cwd,
+          },
           "Background git fetch ref classification failed; using structural refresh",
         );
       }
@@ -3163,7 +3212,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     target.recentFetchRemoteRefChanges.clear();
     for (const change of result.changes) {
-      target.recentFetchRemoteRefChanges.set(change.ref, { change, expiresAtMs });
+      target.recentFetchRemoteRefChanges.set(change.ref, {
+        change,
+        expiresAtMs,
+      });
     }
     this.flushBufferedFetchMetadataEvents(target);
     if (
@@ -3179,7 +3231,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     const refreshes = new Map<string, RepoMetadataWorkspaceRefresh>();
     for (const change of result.changes) {
-      this.routeRemoteBranchRef(target, change.ref, refreshes, { narrow: true });
+      this.routeRemoteBranchRef(target, change.ref, refreshes, {
+        narrow: true,
+      });
     }
     this.scheduleRepoMetadataRefresh(target, "repo-fetch", false, refreshes);
   }
@@ -3202,8 +3256,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     );
   }
 
-  private removeWorkspaceListener(cwd: string, listener: WorkspaceGitListener): void {
-    const target = this.workspaceTargets.get(cwd);
+  private removeWorkspaceListener(key: string, listener: WorkspaceGitListener): void {
+    const target = this.workspaceTargets.get(key);
     if (!target) {
       return;
     }
@@ -3219,17 +3273,20 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private removeWorkspaceTarget(target: WorkspaceGitTarget): void {
     if (target.repoGitRoot) {
       const repoTarget = this.repoTargets.get(target.repoGitRoot);
-      repoTarget?.workspaceKeys.delete(target.cwd);
+      repoTarget?.workspaceKeys.delete(target.key);
       if (repoTarget && repoTarget.workspaceKeys.size === 0) {
         this.closeRepoTarget(repoTarget);
         this.repoTargets.delete(target.repoGitRoot);
       } else if (repoTarget?.cwd === target.cwd) {
-        repoTarget.cwd = repoTarget.workspaceKeys.values().next().value ?? repoTarget.cwd;
+        const replacementKey = repoTarget.workspaceKeys.values().next().value;
+        repoTarget.cwd =
+          (replacementKey ? this.workspaceTargets.get(replacementKey)?.cwd : undefined) ??
+          repoTarget.cwd;
       }
     }
 
     this.closeWorkspaceTarget(target);
-    this.workspaceTargets.delete(target.cwd);
+    this.workspaceTargets.delete(target.key);
   }
 
   private removeWorkingTreeWatchListener(cwd: string, listener: () => void): void {
@@ -3277,7 +3334,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private closeWorkspaceTarget(target: WorkspaceGitTarget): void {
     target.closed = true;
     if (target.workingTreeWatchTarget) {
-      this.removeWorkspaceWorkingTreeLink(target.workingTreeWatchTarget, target.cwd);
+      this.removeWorkspaceWorkingTreeLink(target.workingTreeWatchTarget, target.key);
       target.workingTreeWatchTarget = null;
     }
     if (target.debounceTimer) {

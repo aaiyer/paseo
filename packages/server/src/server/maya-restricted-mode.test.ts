@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -7,12 +8,17 @@ import { SessionInboundMessageSchema, type SessionInboundMessage } from "./messa
 import {
   evaluateMayaRestrictedSessionMessage,
   MAYA_RESTRICTED_ALLOWED_SESSION_MESSAGE_TYPES,
+  openMayaRestrictedWorkspaceAuthority,
 } from "./maya-restricted-mode.js";
 import {
   installFileExplorerBeforeReadOpenHookForTest,
   listDirectoryEntries,
   readExplorerFile,
 } from "./file-explorer/service.js";
+import {
+  installAfterMayaAuthorityValidationHookForTest,
+  runGitCommand,
+} from "../utils/run-git-command.js";
 
 const PINNED_UPSTREAM_INBOUND_TYPES = [
   "hub.execution.agent.create.request",
@@ -245,7 +251,11 @@ const PINNED_ALLOWED_TYPES = [
 
 const WORKSPACES = [
   { workspaceId: "registered", cwd: "/srv/maya/worktree", archivedAt: null },
-  { workspaceId: "archived", cwd: "/srv/maya/archived", archivedAt: "2026-08-18T00:00:00Z" },
+  {
+    workspaceId: "archived",
+    cwd: "/srv/maya/archived",
+    archivedAt: "2026-08-18T00:00:00Z",
+  },
 ];
 
 function parseMessage(input: unknown): SessionInboundMessage {
@@ -269,8 +279,16 @@ describe("Maya restricted mode", () => {
   });
 
   test.each([
-    { type: "checkout_commit_request", cwd: "/srv/maya/worktree", requestId: "git" },
-    { type: "create_terminal_request", cwd: "/srv/maya/worktree", requestId: "terminal" },
+    {
+      type: "checkout_commit_request",
+      cwd: "/srv/maya/worktree",
+      requestId: "git",
+    },
+    {
+      type: "create_terminal_request",
+      cwd: "/srv/maya/worktree",
+      requestId: "terminal",
+    },
     {
       type: "workspace.script.start.request",
       workspaceId: "registered",
@@ -341,7 +359,9 @@ describe("Maya restricted mode", () => {
       requestId: "create",
     };
     expect(evaluate(base)).toEqual({ allowed: true, reason: "allowed" });
-    expect(evaluate({ ...base, workspaceId: "missing" })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, workspaceId: "missing" })).toMatchObject({
+      allowed: false,
+    });
     expect(evaluate({ ...base, config: { ...base.config, cwd: "/tmp" } })).toMatchObject({
       allowed: false,
     });
@@ -349,7 +369,10 @@ describe("Maya restricted mode", () => {
       allowed: false,
     });
     expect(
-      evaluate({ ...base, worktree: { mode: "branch-off", newBranch: "escape" } }),
+      evaluate({
+        ...base,
+        worktree: { mode: "branch-off", newBranch: "escape" },
+      }),
     ).toMatchObject({ allowed: false });
   });
 
@@ -363,7 +386,11 @@ describe("Maya restricted mode", () => {
       }),
     ).toEqual({ allowed: true, reason: "allowed" });
     expect(
-      evaluate({ type: "cancel_agent_request", agentId: "agent", requestId: "missing-turn" }),
+      evaluate({
+        type: "cancel_agent_request",
+        agentId: "agent",
+        requestId: "missing-turn",
+      }),
     ).toMatchObject({ allowed: false });
     expect(
       evaluate({
@@ -414,12 +441,18 @@ describe("Maya restricted mode", () => {
       }),
     ).toMatchObject({ allowed: false });
     expect(
-      evaluate({ type: "provider_diagnostic_request", provider: "claude", requestId: "provider" }),
+      evaluate({
+        type: "provider_diagnostic_request",
+        provider: "claude",
+        requestId: "provider",
+      }),
     ).toMatchObject({ allowed: false });
   });
 
   test("future message types hit the default deny", () => {
-    const future = { type: "future.authority.request" } as unknown as SessionInboundMessage;
+    const future = {
+      type: "future.authority.request",
+    } as unknown as SessionInboundMessage;
     expect(evaluateMayaRestrictedSessionMessage(future, WORKSPACES)).toMatchObject({
       allowed: false,
     });
@@ -435,7 +468,10 @@ describe("Maya restricted mode", () => {
         "Access outside of workspace is not allowed",
       );
       await expect(
-        readExplorerFile({ root, relativePath: path.join(outside, "secret.txt") }),
+        readExplorerFile({
+          root,
+          relativePath: path.join(outside, "secret.txt"),
+        }),
       ).rejects.toThrow("Access outside of workspace is not allowed");
       await expect(readExplorerFile({ root, relativePath: "escape/secret.txt" })).rejects.toThrow(
         "Access outside of workspace is not allowed",
@@ -486,6 +522,57 @@ describe("Maya restricted mode", () => {
           rm(root, { recursive: true, force: true }),
           rm(outside, { recursive: true, force: true }),
         ]);
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "binds a linked worktree Git directory across initial and mid-command .git redirection",
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), "maya-restricted-gitdir-"));
+      const repository = path.join(root, "repository");
+      const selected = path.join(root, "selected");
+      const sibling = path.join(root, "sibling");
+      let authority: Awaited<ReturnType<typeof openMayaRestrictedWorkspaceAuthority>> | null = null;
+      let restoreHook = () => {};
+      try {
+        execFileSync("git", ["init", "--initial-branch=main", repository]);
+        execFileSync("git", ["-C", repository, "config", "user.name", "Paseo Test"]);
+        execFileSync("git", ["-C", repository, "config", "user.email", "paseo@example.invalid"]);
+        await writeFile(path.join(repository, "tracked.txt"), "base\n");
+        execFileSync("git", ["-C", repository, "add", "tracked.txt"]);
+        execFileSync("git", ["-C", repository, "commit", "-m", "base"]);
+        execFileSync("git", ["-C", repository, "branch", "selected"]);
+        execFileSync("git", ["-C", repository, "branch", "sibling"]);
+        execFileSync("git", ["-C", repository, "worktree", "add", selected, "selected"]);
+        execFileSync("git", ["-C", repository, "worktree", "add", sibling, "sibling"]);
+
+        const selectedLink = await readFile(path.join(selected, ".git"), "utf8");
+        const siblingLink = await readFile(path.join(sibling, ".git"), "utf8");
+        authority = await openMayaRestrictedWorkspaceAuthority(selected);
+
+        await writeFile(path.join(selected, ".git"), siblingLink);
+        await expect(
+          runGitCommand(["rev-parse", "--abbrev-ref", "HEAD"], {
+            cwd: authority.rootAccessPath,
+          }),
+        ).rejects.toThrow("Git directory identity changed");
+
+        await writeFile(path.join(selected, ".git"), selectedLink);
+        restoreHook = installAfterMayaAuthorityValidationHookForTest(async () => {
+          await writeFile(path.join(selected, ".git"), siblingLink);
+        });
+        const result = await runGitCommand(["rev-parse", "--abbrev-ref", "HEAD"], {
+          cwd: authority.rootAccessPath,
+        });
+        expect(result.stdout.trim()).toBe("selected");
+        expect(result.stdout).not.toContain("sibling");
+      } finally {
+        restoreHook();
+        if (authority) {
+          await authority.release();
+        }
+        await rm(root, { recursive: true, force: true });
       }
     },
   );
