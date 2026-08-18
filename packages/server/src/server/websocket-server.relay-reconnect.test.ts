@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Server as HTTPServer } from "http";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type pino from "pino";
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
@@ -8,6 +11,8 @@ import type { DaemonConfigStore } from "./daemon-config-store.js";
 import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import type { WorkspaceAutoName } from "./workspace-auto-name.js";
+import type { PersistedWorkspaceRecord, WorkspaceRegistry } from "./workspace-registry.js";
+import { deriveMayaRestrictedWorkspaceId } from "./maya-restricted-mode.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
 import { createProviderSnapshotManagerStub } from "./test-utils/session-stubs.js";
 import {
@@ -214,6 +219,7 @@ function createServer(options?: {
   speechReadiness?: SpeechReadinessSnapshot | null;
   logger?: ReturnType<typeof createLogger>;
   startPaused?: boolean;
+  workspaces?: PersistedWorkspaceRecord[];
 }) {
   const speechReadiness = options?.speechReadiness ?? null;
   const daemonConfigStore = {
@@ -265,7 +271,7 @@ function createServer(options?: {
     TEST_DAEMON_VERSION,
     undefined,
     undefined,
-    undefined,
+    createStub<WorkspaceRegistry>({ list: async () => options?.workspaces ?? [] }),
     createStub<ScheduleService>({}),
     createStub<CheckoutDiffManager>({
       subscribe: vi.fn(),
@@ -730,10 +736,7 @@ describe("relay external socket reconnect behavior", () => {
         },
       },
     });
-    expect(logger.warn).not.toHaveBeenCalledWith(
-      expect.anything(),
-      "ws_control_rpc_received",
-    );
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.anything(), "ws_control_rpc_received");
 
     await server.close();
   });
@@ -1192,6 +1195,87 @@ describe("Maya restricted mode production ingress", () => {
     });
     expect(session.handleMessage).not.toHaveBeenCalled();
     await server.close();
+  });
+
+  test("rejects a recreated workspace identity without blocking an unaffected read", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "maya-restricted-workspaces-"));
+    const staleCwd = path.join(root, "stale");
+    const healthyCwd = path.join(root, "healthy");
+    await Promise.all([
+      mkdir(path.join(staleCwd, ".git"), { recursive: true }),
+      mkdir(path.join(healthyCwd, ".git"), { recursive: true }),
+    ]);
+    const timestamp = "2026-08-19T00:00:00.000Z";
+    const workspace = async (cwd: string): Promise<PersistedWorkspaceRecord> => ({
+      workspaceId: await deriveMayaRestrictedWorkspaceId(cwd),
+      projectId: "project-maya",
+      cwd,
+      kind: "local_checkout",
+      displayName: path.basename(cwd),
+      title: null,
+      branch: "main",
+      worktreeRoot: cwd,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      archivedAt: null,
+      autoArchivedChangeRequestUrl: null,
+      pinnedAt: null,
+    });
+    const workspaces = await Promise.all([workspace(staleCwd), workspace(healthyCwd)]);
+    const server = createServer({ workspaces });
+    const socket = new MockSocket();
+
+    try {
+      await attachRelayAndHello({ server, socket, clientId: "maya-restricted-workspace-id" });
+      const session = sessionMock.instances[0];
+      socket.emit(
+        "message",
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "checkout_status_request",
+            cwd: healthyCwd,
+            requestId: "healthy-read",
+          },
+        }),
+      );
+      await vi.waitFor(() => expect(session.handleMessage).toHaveBeenCalledTimes(1));
+
+      await rm(staleCwd, { recursive: true, force: true });
+      await mkdir(path.join(staleCwd, ".git"), { recursive: true });
+      socket.emit(
+        "message",
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "checkout_status_request",
+            cwd: staleCwd,
+            requestId: "stale-read",
+          },
+        }),
+      );
+      await vi.waitFor(() => {
+        expect(sentEnvelopes(socket)).toContainEqual({
+          type: "session",
+          message: {
+            type: "rpc_error",
+            payload: {
+              requestId: "stale-read",
+              requestType: "checkout_status_request",
+              error: "Request is disabled in Maya restricted mode",
+              code: "access_denied",
+            },
+          },
+        });
+      });
+      expect(session.handleMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("drops terminal binary frames before they reach Session", async () => {

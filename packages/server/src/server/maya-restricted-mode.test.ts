@@ -1,4 +1,4 @@
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -8,7 +8,11 @@ import {
   evaluateMayaRestrictedSessionMessage,
   MAYA_RESTRICTED_ALLOWED_SESSION_MESSAGE_TYPES,
 } from "./maya-restricted-mode.js";
-import { readExplorerFile } from "./file-explorer/service.js";
+import {
+  installFileExplorerBeforeReadOpenHookForTest,
+  listDirectoryEntries,
+  readExplorerFile,
+} from "./file-explorer/service.js";
 
 const PINNED_UPSTREAM_INBOUND_TYPES = [
   "hub.execution.agent.create.request",
@@ -267,13 +271,34 @@ describe("Maya restricted mode", () => {
   test.each([
     { type: "checkout_commit_request", cwd: "/srv/maya/worktree", requestId: "git" },
     { type: "create_terminal_request", cwd: "/srv/maya/worktree", requestId: "terminal" },
-    { type: "workspace.script.start.request", workspaceId: "registered", scriptName: "x", requestId: "script" },
+    {
+      type: "workspace.script.start.request",
+      workspaceId: "registered",
+      scriptName: "x",
+      requestId: "script",
+    },
     { type: "schedule/list", requestId: "schedule" },
     { type: "set_daemon_config_request", requestId: "config", config: {} },
     { type: "plugin.list.request", requestId: "plugin" },
-    { type: "hub.execution.control.request", requestId: "hub", executionId: "x", action: "interrupt" },
-    { type: "workspace.create.request", source: { kind: "directory", path: "/srv/maya/worktree", projectId: "x" }, requestId: "workspace" },
-    { type: "fs.file.write.request", cwd: "/srv/maya/worktree", path: "x", content: "x", expectedModifiedAt: "x", requestId: "file" },
+    {
+      type: "hub.execution.control.request",
+      requestId: "hub",
+      executionId: "x",
+      action: "interrupt",
+    },
+    {
+      type: "workspace.create.request",
+      source: { kind: "directory", path: "/srv/maya/worktree", projectId: "x" },
+      requestId: "workspace",
+    },
+    {
+      type: "fs.file.write.request",
+      cwd: "/srv/maya/worktree",
+      path: "x",
+      content: "x",
+      expectedModifiedAt: "x",
+      requestId: "file",
+    },
     { type: "chat/list", requestId: "chat" },
     { type: "loop/list", requestId: "loop" },
   ])("denies authority-bearing $type", (message) => {
@@ -281,9 +306,31 @@ describe("Maya restricted mode", () => {
   });
 
   test("allows only exact registered workspace read paths", () => {
-    expect(evaluate({ type: "file_explorer_request", cwd: "/srv/maya/worktree", path: "docs", mode: "list", requestId: "ok" })).toEqual({ allowed: true, reason: "allowed" });
-    expect(evaluate({ type: "file_explorer_request", cwd: "/srv/maya/worktree/..", path: ".", mode: "list", requestId: "escape" })).toMatchObject({ allowed: false });
-    expect(evaluate({ type: "checkout_status_request", cwd: "/srv/maya/archived", requestId: "archived" })).toMatchObject({ allowed: false });
+    expect(
+      evaluate({
+        type: "file_explorer_request",
+        cwd: "/srv/maya/worktree",
+        path: "docs",
+        mode: "list",
+        requestId: "ok",
+      }),
+    ).toEqual({ allowed: true, reason: "allowed" });
+    expect(
+      evaluate({
+        type: "file_explorer_request",
+        cwd: "/srv/maya/worktree/..",
+        path: ".",
+        mode: "list",
+        requestId: "escape",
+      }),
+    ).toMatchObject({ allowed: false });
+    expect(
+      evaluate({
+        type: "checkout_status_request",
+        cwd: "/srv/maya/archived",
+        requestId: "archived",
+      }),
+    ).toMatchObject({ allowed: false });
   });
 
   test("allows only a fixed Codex agent in a pre-registered workspace", () => {
@@ -295,26 +342,87 @@ describe("Maya restricted mode", () => {
     };
     expect(evaluate(base)).toEqual({ allowed: true, reason: "allowed" });
     expect(evaluate({ ...base, workspaceId: "missing" })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, config: { ...base.config, cwd: "/tmp" } })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, config: { ...base.config, model: "mutable" } })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, worktree: { mode: "branch-off", newBranch: "escape" } })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, config: { ...base.config, cwd: "/tmp" } })).toMatchObject({
+      allowed: false,
+    });
+    expect(evaluate({ ...base, config: { ...base.config, model: "mutable" } })).toMatchObject({
+      allowed: false,
+    });
+    expect(
+      evaluate({ ...base, worktree: { mode: "branch-off", newBranch: "escape" } }),
+    ).toMatchObject({ allowed: false });
   });
 
   test("preserves native approvals but rejects terminal and provider widening", () => {
-    expect(evaluate({ type: "cancel_agent_request", agentId: "agent", turnId: "turn-1", requestId: "cancel" })).toEqual({ allowed: true, reason: "allowed" });
-    expect(evaluate({ type: "cancel_agent_request", agentId: "agent", requestId: "missing-turn" })).toMatchObject({ allowed: false });
-    expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "approval", response: { behavior: "allow" } })).toEqual({ allowed: true, reason: "allowed" });
-    expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "deny", response: { behavior: "deny", interrupt: true, message: "cancel" } })).toEqual({ allowed: true, reason: "allowed" });
-    expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "permissions", response: { behavior: "allow", updatedPermissions: [{ path: "/" }] } })).toMatchObject({ allowed: false });
-    expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "input", response: { behavior: "allow", updatedInput: { command: "widen" } } })).toMatchObject({ allowed: false });
-    expect(evaluate({ type: "agent_permission_response", agentId: "agent", requestId: "action", response: { behavior: "allow", selectedActionId: "allow_always" } })).toMatchObject({ allowed: false });
-    expect(evaluate({ type: "close_items_request", agentIds: [], terminalIds: ["terminal"], requestId: "close" })).toMatchObject({ allowed: false });
-    expect(evaluate({ type: "provider_diagnostic_request", provider: "claude", requestId: "provider" })).toMatchObject({ allowed: false });
+    expect(
+      evaluate({
+        type: "cancel_agent_request",
+        agentId: "agent",
+        turnId: "turn-1",
+        requestId: "cancel",
+      }),
+    ).toEqual({ allowed: true, reason: "allowed" });
+    expect(
+      evaluate({ type: "cancel_agent_request", agentId: "agent", requestId: "missing-turn" }),
+    ).toMatchObject({ allowed: false });
+    expect(
+      evaluate({
+        type: "agent_permission_response",
+        agentId: "agent",
+        requestId: "approval",
+        response: { behavior: "allow" },
+      }),
+    ).toEqual({ allowed: true, reason: "allowed" });
+    expect(
+      evaluate({
+        type: "agent_permission_response",
+        agentId: "agent",
+        requestId: "deny",
+        response: { behavior: "deny", interrupt: true, message: "cancel" },
+      }),
+    ).toEqual({ allowed: true, reason: "allowed" });
+    expect(
+      evaluate({
+        type: "agent_permission_response",
+        agentId: "agent",
+        requestId: "permissions",
+        response: { behavior: "allow", updatedPermissions: [{ path: "/" }] },
+      }),
+    ).toMatchObject({ allowed: false });
+    expect(
+      evaluate({
+        type: "agent_permission_response",
+        agentId: "agent",
+        requestId: "input",
+        response: { behavior: "allow", updatedInput: { command: "widen" } },
+      }),
+    ).toMatchObject({ allowed: false });
+    expect(
+      evaluate({
+        type: "agent_permission_response",
+        agentId: "agent",
+        requestId: "action",
+        response: { behavior: "allow", selectedActionId: "allow_always" },
+      }),
+    ).toMatchObject({ allowed: false });
+    expect(
+      evaluate({
+        type: "close_items_request",
+        agentIds: [],
+        terminalIds: ["terminal"],
+        requestId: "close",
+      }),
+    ).toMatchObject({ allowed: false });
+    expect(
+      evaluate({ type: "provider_diagnostic_request", provider: "claude", requestId: "provider" }),
+    ).toMatchObject({ allowed: false });
   });
 
   test("future message types hit the default deny", () => {
     const future = { type: "future.authority.request" } as unknown as SessionInboundMessage;
-    expect(evaluateMayaRestrictedSessionMessage(future, WORKSPACES)).toMatchObject({ allowed: false });
+    expect(evaluateMayaRestrictedSessionMessage(future, WORKSPACES)).toMatchObject({
+      allowed: false,
+    });
   });
 
   test("the production file reader rejects traversal and symlink escapes", async () => {
@@ -329,9 +437,9 @@ describe("Maya restricted mode", () => {
       await expect(
         readExplorerFile({ root, relativePath: path.join(outside, "secret.txt") }),
       ).rejects.toThrow("Access outside of workspace is not allowed");
-      await expect(
-        readExplorerFile({ root, relativePath: "escape/secret.txt" }),
-      ).rejects.toThrow("Access outside of workspace is not allowed");
+      await expect(readExplorerFile({ root, relativePath: "escape/secret.txt" })).rejects.toThrow(
+        "Access outside of workspace is not allowed",
+      );
     } finally {
       await Promise.all([
         rm(root, { recursive: true, force: true }),
@@ -339,4 +447,46 @@ describe("Maya restricted mode", () => {
       ]);
     }
   });
+
+  test.skipIf(process.platform !== "linux")(
+    "descriptor-bound reads reject an intermediate symlink swap without exposing outside data",
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), "maya-restricted-race-root-"));
+      const outside = await mkdtemp(path.join(tmpdir(), "maya-restricted-race-outside-"));
+      const intermediate = path.join(root, "inside");
+      let restoreHook = () => {};
+      try {
+        await mkdir(intermediate);
+        await writeFile(path.join(intermediate, "document.txt"), "safe");
+        await writeFile(path.join(outside, "document.txt"), "outside-secret");
+        await writeFile(path.join(outside, "outside-name.txt"), "outside-listing");
+
+        restoreHook = installFileExplorerBeforeReadOpenHookForTest(async () => {
+          await rm(intermediate, { recursive: true });
+          await symlink(outside, intermediate, "dir");
+        });
+        await expect(
+          readExplorerFile({ root, relativePath: "inside/document.txt" }),
+        ).rejects.toThrow("Access outside of workspace is not allowed");
+
+        restoreHook();
+        await rm(intermediate);
+        await mkdir(intermediate);
+        await writeFile(path.join(intermediate, "safe-name.txt"), "safe");
+        restoreHook = installFileExplorerBeforeReadOpenHookForTest(async () => {
+          await rm(intermediate, { recursive: true });
+          await symlink(outside, intermediate, "dir");
+        });
+        await expect(listDirectoryEntries({ root, relativePath: "inside" })).rejects.toThrow(
+          "Access outside of workspace is not allowed",
+        );
+      } finally {
+        restoreHook();
+        await Promise.all([
+          rm(root, { recursive: true, force: true }),
+          rm(outside, { recursive: true, force: true }),
+        ]);
+      }
+    },
+  );
 });

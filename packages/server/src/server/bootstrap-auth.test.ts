@@ -151,4 +151,58 @@ describe("daemon bearer auth", () => {
       await daemonHandle.close();
     }
   });
+
+  test("keeps health and a valid authentication responsive during a bounded invalid burst", async () => {
+    const daemonHandle = await createTestPaseoDaemon({
+      auth: { password: CORRECT_PASSWORD_HASH },
+    });
+    const sockets: WebSocket[] = [];
+    try {
+      const validConnection = connectWebSocket({
+        port: daemonHandle.port,
+        protocol: "paseo.bearer.correct-password",
+      }).then(({ ws }) => {
+        sockets.push(ws);
+        return ws;
+      });
+      const invalidConnections = Array.from({ length: 12 }, (_, index) =>
+        connectWebSocket({
+          port: daemonHandle.port,
+          protocol: `paseo.bearer.wrong-password-${index}`,
+        }).then(
+          ({ ws }) =>
+            new Promise<{ code: number; reason: string }>((resolve) => {
+              sockets.push(ws);
+              ws.once("close", (code, reason) => {
+                resolve({ code, reason: reason.toString() });
+              });
+            }),
+        ),
+      );
+
+      const health = await Promise.race([
+        fetch(`http://127.0.0.1:${daemonHandle.port}/api/health`),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("health probe stalled behind password verification")),
+            250,
+          ),
+        ),
+      ]);
+      expect(health.status).toBe(200);
+      const valid = await validConnection;
+      const rejected = await Promise.all(invalidConnections);
+      expect(rejected).toHaveLength(12);
+      expect(rejected.every(({ code }) => code === 4401)).toBe(true);
+      expect(
+        rejected.every(({ reason }) =>
+          ["Incorrect password", "Too many authentication attempts"].includes(reason),
+        ),
+      ).toBe(true);
+      expect(valid.readyState).toBe(WebSocket.OPEN);
+    } finally {
+      for (const socket of sockets) socket.close();
+      await daemonHandle.close();
+    }
+  });
 });

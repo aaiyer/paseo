@@ -98,7 +98,26 @@ export const FILE_EXPLORER_STREAM_CHUNK_BYTES = 256 * 1024;
 export const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
 const READ_FILE_OPEN_FLAGS =
   process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
+const READ_DIRECTORY_OPEN_FLAGS =
+  process.platform === "win32"
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const ACCESS_OUTSIDE_WORKSPACE_MESSAGE = "Access outside of workspace is not allowed";
+let beforeScopedReadOpenForTest: (() => Promise<void>) | null = null;
+
+/** Deterministic race seam for production read-path regression tests only. */
+export function installFileExplorerBeforeReadOpenHookForTest(
+  hook: () => Promise<void>,
+): () => void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("file explorer read hook is test-only");
+  }
+  if (beforeScopedReadOpenForTest) throw new Error("file explorer read hook is already installed");
+  beforeScopedReadOpenForTest = hook;
+  return () => {
+    if (beforeScopedReadOpenForTest === hook) beforeScopedReadOpenForTest = null;
+  };
+}
 
 function fileRevision(stats: BigIntStats): string {
   return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}`;
@@ -144,50 +163,61 @@ export async function listDirectoryEntries({
   root,
   relativePath = ".",
 }: ListDirectoryParams): Promise<FileExplorerDirectory> {
-  const directoryPath = await resolveScopedPath({ root, relativePath });
-  const stats = await fs.stat(directoryPath.resolvedPath);
-
-  if (!stats.isDirectory()) {
-    throw new Error("Requested path is not a directory");
-  }
-
-  const dirents = await fs.readdir(directoryPath.resolvedPath, { withFileTypes: true });
-
-  const entriesWithNulls = await Promise.all(
-    dirents.map(async (dirent) => {
-      const targetPath = path.join(directoryPath.requestedPath, dirent.name);
-      const kind: ExplorerEntryKind = dirent.isDirectory() ? "directory" : "file";
-      try {
-        return await buildEntryPayload({
-          root,
-          targetPath,
-          name: dirent.name,
-          kind,
-        });
-      } catch (error) {
-        // Directories can contain dangling links (e.g. AGENTS.md -> CLAUDE.md).
-        // Skip entries whose targets disappeared instead of failing the whole listing.
-        if (isMissingEntryError(error) || isOutsideWorkspaceError(error)) {
-          return null;
-        }
-        throw error;
-      }
-    }),
-  );
-  const entries = entriesWithNulls.filter((entry): entry is FileExplorerEntry => entry !== null);
-
-  entries.sort((a, b) => {
-    const modifiedComparison = new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime();
-    if (modifiedComparison !== 0) {
-      return modifiedComparison;
-    }
-    return a.name.localeCompare(b.name);
+  const opened = await openScopedPathForRead({
+    root,
+    relativePath,
+    kind: "directory",
   });
 
-  return {
-    path: normalizeRelativePath({ root, targetPath: directoryPath.requestedPath }),
-    entries,
-  };
+  try {
+    const stats = await opened.handle.stat();
+    if (!stats.isDirectory()) {
+      throw new Error("Requested path is not a directory");
+    }
+
+    const descriptorPath = descriptorPathFor(opened.handle);
+    const dirents = await fs.readdir(descriptorPath, { withFileTypes: true });
+
+    const entriesWithNulls = await Promise.all(
+      dirents.map(async (dirent) => {
+        const targetPath = path.join(opened.scoped.requestedPath, dirent.name);
+        const kind: ExplorerEntryKind = dirent.isDirectory() ? "directory" : "file";
+        try {
+          return await buildDescriptorBoundEntryPayload({
+            root,
+            descriptorPath,
+            targetPath,
+            name: dirent.name,
+            kind,
+          });
+        } catch (error) {
+          // Directories can contain dangling links (e.g. AGENTS.md -> CLAUDE.md).
+          // Skip entries whose targets disappeared instead of failing the whole listing.
+          if (isMissingEntryError(error) || isOutsideWorkspaceError(error)) {
+            return null;
+          }
+          throw error;
+        }
+      }),
+    );
+    const entries = entriesWithNulls.filter((entry): entry is FileExplorerEntry => entry !== null);
+
+    entries.sort((a, b) => {
+      const modifiedComparison =
+        new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime();
+      if (modifiedComparison !== 0) {
+        return modifiedComparison;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    return {
+      path: normalizeRelativePath({ root, targetPath: opened.scoped.requestedPath }),
+      entries,
+    };
+  } finally {
+    await opened.handle.close();
+  }
 }
 
 export async function readExplorerFile({
@@ -237,8 +267,8 @@ export async function readExplorerFileBytes({
   root,
   relativePath,
 }: ReadFileParams): Promise<FileExplorerFileBytes> {
-  const filePath = await resolveScopedPath({ root, relativePath });
-  const handle = await openFileForRead(filePath.resolvedPath);
+  const opened = await openScopedPathForRead({ root, relativePath, kind: "file" });
+  const { handle } = opened;
 
   try {
     const stats = await handle.stat({ bigint: true });
@@ -247,9 +277,9 @@ export async function readExplorerFileBytes({
       throw new Error("Requested path is not a file");
     }
 
-    const ext = path.extname(filePath.resolvedPath).toLowerCase();
+    const ext = path.extname(opened.actualPath).toLowerCase();
     const basePayload = {
-      path: normalizeRelativePath({ root, targetPath: filePath.requestedPath }),
+      path: normalizeRelativePath({ root, targetPath: opened.scoped.requestedPath }),
       size: Number(stats.size),
       modifiedAt: stats.mtime.toISOString(),
       revision: fileRevision(stats),
@@ -292,8 +322,8 @@ export async function streamExplorerFile(
   { root, relativePath }: ReadFileParams,
   consume: (file: FileExplorerFileStream) => Promise<void>,
 ): Promise<void> {
-  const filePath = await resolveScopedPath({ root, relativePath });
-  const handle = await openFileForRead(filePath.resolvedPath);
+  const opened = await openScopedPathForRead({ root, relativePath, kind: "file" });
+  const { handle } = opened;
 
   try {
     const stats = await handle.stat({ bigint: true });
@@ -303,7 +333,7 @@ export async function streamExplorerFile(
 
     const advertisedSize = Number(stats.size);
     const advertisedRevision = fileRevision(stats);
-    const ext = path.extname(filePath.resolvedPath).toLowerCase();
+    const ext = path.extname(opened.actualPath).toLowerCase();
     const isImage = ext in IMAGE_MIME_TYPES;
     const isBinary = isImage || (await isFileHandleBinary(handle, advertisedSize));
     let kind: ExplorerFileKind = "text";
@@ -317,7 +347,7 @@ export async function streamExplorerFile(
     }
 
     await consume({
-      path: normalizeRelativePath({ root, targetPath: filePath.requestedPath }),
+      path: normalizeRelativePath({ root, targetPath: opened.scoped.requestedPath }),
       kind,
       encoding: isBinary ? "binary" : "utf-8",
       mimeType,
@@ -815,24 +845,96 @@ async function openFileForRead(filePath: string): Promise<FileHandle> {
   return fs.open(filePath, READ_FILE_OPEN_FLAGS);
 }
 
-async function buildEntryPayload({
+interface OpenedScopedPath {
+  scoped: ScopedPath;
+  handle: FileHandle;
+  actualPath: string;
+}
+
+async function openScopedPathForRead(input: {
+  root: string;
+  relativePath: string;
+  kind: ExplorerEntryKind;
+}): Promise<OpenedScopedPath> {
+  const scoped = await resolveScopedPath(input);
+  const hook = beforeScopedReadOpenForTest;
+  beforeScopedReadOpenForTest = null;
+  await hook?.();
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(
+      scoped.requestedPath,
+      input.kind === "directory" ? READ_DIRECTORY_OPEN_FLAGS : READ_FILE_OPEN_FLAGS,
+    );
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOTDIR" || code === "ELOOP") {
+      try {
+        const [realRoot, currentTarget] = await Promise.all([
+          fs.realpath(expandUserPath(input.root)),
+          fs.realpath(scoped.requestedPath),
+        ]);
+        requirePathWithinRoot(realRoot, currentTarget);
+      } catch (validationError) {
+        if (isOutsideWorkspaceError(validationError)) throw validationError;
+      }
+    }
+    throw error;
+  }
+  try {
+    const actualPath = await validateOpenedPathWithinRoot(handle, input.root);
+    return { scoped, handle, actualPath };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+function descriptorPathFor(handle: FileHandle): string {
+  if (process.platform !== "linux") {
+    throw new Error("descriptor-bound workspace reads require Linux");
+  }
+  return `/proc/self/fd/${handle.fd}`;
+}
+
+async function validateOpenedPathWithinRoot(handle: FileHandle, root: string): Promise<string> {
+  const realRoot = await fs.realpath(expandUserPath(root));
+  if (process.platform === "linux") {
+    const actualPath = await fs.realpath(descriptorPathFor(handle));
+    requirePathWithinRoot(realRoot, actualPath);
+    return actualPath;
+  }
+  throw new Error("descriptor-bound workspace reads require Linux");
+}
+
+function requirePathWithinRoot(realRoot: string, targetPath: string): void {
+  const relative = path.relative(realRoot, targetPath);
+  if (relative !== "" && (relative.startsWith("..") || path.isAbsolute(relative))) {
+    throw new Error(ACCESS_OUTSIDE_WORKSPACE_MESSAGE);
+  }
+}
+
+async function buildDescriptorBoundEntryPayload({
   root,
+  descriptorPath,
   targetPath,
   name,
   kind,
-}: EntryPayloadParams): Promise<FileExplorerEntry> {
-  const entryPath = await resolveScopedPath({
-    root,
-    relativePath: normalizeRelativePath({ root, targetPath }),
-  });
-  const stats = await fs.stat(entryPath.resolvedPath);
-  return {
-    name,
-    path: normalizeRelativePath({ root, targetPath }),
-    kind,
-    size: stats.size,
-    modifiedAt: stats.mtime.toISOString(),
-  };
+}: EntryPayloadParams & { descriptorPath: string }): Promise<FileExplorerEntry> {
+  const handle = await fs.open(path.join(descriptorPath, name), constants.O_RDONLY);
+  try {
+    await validateOpenedPathWithinRoot(handle, root);
+    const stats = await handle.stat();
+    return {
+      name,
+      path: normalizeRelativePath({ root, targetPath }),
+      kind,
+      size: stats.size,
+      modifiedAt: stats.mtime.toISOString(),
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 function isMissingEntryError(error: unknown): boolean {

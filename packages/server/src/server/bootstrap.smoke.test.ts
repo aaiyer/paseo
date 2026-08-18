@@ -18,6 +18,7 @@ import { isPlatform } from "../test-utils/platform.js";
 import { findFreePort } from "./service-proxy.js";
 import {
   configureGitProcessPolicy,
+  runGitCommand,
   snapshotGitCommandRuntimeMetrics,
 } from "../utils/run-git-command.js";
 import { DEFAULT_GIT_PROCESS_POLICY } from "../utils/git-process-scheduler.js";
@@ -79,7 +80,114 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
-  test("reload applies live HTTP, MCP, Git, provider, relay, and app policies", async () => {
+  test("keeps Maya's committed catalog immutable while a provider starts", async () => {
+    const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-maya-catalog-"));
+    const paseoHome = path.join(paseoHomeRoot, ".paseo");
+    const projectsDir = path.join(paseoHome, "projects");
+    const repository = path.join(paseoHomeRoot, "repository");
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    await mkdir(projectsDir, { recursive: true });
+    await mkdir(repository, { recursive: true });
+    await runGitCommand(["init", "-q", "-b", "main"], { cwd: repository });
+
+    const projectPath = path.join(projectsDir, "projects.json");
+    const workspacePath = path.join(projectsDir, "workspaces.json");
+    const generationPath = path.join(projectsDir, "catalog-generation.json");
+    const timestamp = "2026-08-19T00:00:00.000Z";
+    const projectBytes = `${JSON.stringify(
+      [
+        {
+          projectId: "project-maya",
+          rootPath: repository,
+          kind: "git",
+          displayName: "repository",
+          projectKey: null,
+          customName: null,
+          customIconRevision: null,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          archivedAt: null,
+        },
+      ],
+      null,
+      2,
+    )}\n`;
+    const workspaceBytes = `${JSON.stringify(
+      [
+        {
+          workspaceId: "workspace-maya",
+          projectId: "project-maya",
+          cwd: repository,
+          kind: "local_checkout",
+          displayName: "main",
+          title: null,
+          branch: "main",
+          worktreeRoot: repository,
+          baseBranch: null,
+          isPaseoOwnedWorktree: false,
+          mainRepoRoot: null,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          archivedAt: null,
+          autoArchivedChangeRequestUrl: null,
+          pinnedAt: null,
+        },
+      ],
+      null,
+      2,
+    )}\n`;
+    const generationBytes = '{"schema":1,"generation":"maya-test-generation"}\n';
+    await Promise.all([
+      writeFile(projectPath, projectBytes),
+      writeFile(workspacePath, workspaceBytes),
+      writeFile(generationPath, generationBytes),
+    ]);
+
+    const config: PaseoDaemonConfig = {
+      listen: "127.0.0.1:0",
+      paseoHome,
+      corsAllowedOrigins: [],
+      hostnames: true,
+      mcpEnabled: false,
+      staticDir,
+      mcpDebug: false,
+      agentClients: createTestAgentClients(),
+      agentStoragePath: path.join(paseoHome, "agents"),
+      relayEnabled: false,
+      relayEndpoint: "127.0.0.1:9",
+      appBaseUrl: "https://app.paseo.sh",
+      openai: undefined,
+      speech: undefined,
+    };
+    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
+
+    try {
+      await daemon.start();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const agent = await daemon.agentManager.createAgent(
+        { provider: "codex", cwd: repository },
+        undefined,
+        { workspaceId: "workspace-maya" },
+      );
+      expect(agent.provider).toBe("codex");
+      expect(
+        await Promise.all([
+          readFile(projectPath, "utf8"),
+          readFile(workspacePath, "utf8"),
+          readFile(generationPath, "utf8"),
+        ]),
+      ).toEqual([projectBytes, workspaceBytes, generationBytes]);
+    } finally {
+      await daemon.stop().catch(() => undefined);
+      await daemon.agentManager.flush().catch(() => undefined);
+      await Promise.all([
+        rm(paseoHomeRoot, { recursive: true, force: true }),
+        rm(staticDir, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
+  test("restricted mode denies live daemon config reload", async () => {
     const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-config-reload-runtime-"));
     const paseoHome = path.join(paseoHomeRoot, ".paseo");
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
@@ -190,73 +298,23 @@ describe("paseo daemon bootstrap", () => {
       };
       await writeFile(configPath, `${JSON.stringify(reloadedPersisted, null, 2)}\n`, "utf-8");
 
-      const result = await client.reloadDaemonConfig("runtime-policies");
-
-      expect(result).toEqual({
-        requestId: "runtime-policies",
-        appliedPaths: [
-          "agents.catalogRefreshTimeoutMs",
-          "agents.providers",
-          "app.baseUrl",
-          "daemon.cors.allowedOrigins",
-          "daemon.git.maxProcessConcurrency",
-          "daemon.git.maxProcessesPerSecond",
-          "daemon.hostnames",
-          "daemon.mcp.enabled",
-          "daemon.relay.enabled",
-          "daemon.trustedProxies",
-        ],
-        restartRequiredPaths: [],
-        overrideControlledPaths: [],
+      await expect(client.reloadDaemonConfig("runtime-policies")).rejects.toMatchObject({
+        code: "access_denied",
       });
       expect(
         (await httpGetWithHost(target.port, "before.example.test", "/api/health")).status,
-      ).toBe(403);
+      ).toBe(200);
       expect((await httpGetWithHost(target.port, "after.example.test", "/api/health")).status).toBe(
-        200,
-      );
-      const afterCors = await fetch(`http://127.0.0.1:${target.port}/api/health`, {
-        headers: { Origin: "https://after.example.test" },
-      });
-      expect(afterCors.headers.get("access-control-allow-origin")).toBe(
-        "https://after.example.test",
+        403,
       );
       const afterProxyReload = await httpGetWithHost(target.port, proxyHost, "/", {
         "x-forwarded-proto": "https",
       });
-      expect(await afterProxyReload.text()).toBe("https");
-      await expect(
-        probeWebSocketConnection(`ws://127.0.0.1:${target.port}/ws`, {
-          host: "after.example.test",
-          origin: "https://after.example.test",
-        }),
-      ).resolves.toEqual({ status: "connected" });
-      await expect(
-        probeWebSocketConnection(`ws://127.0.0.1:${target.port}/ws`, {
-          host: "after.example.test",
-          origin: "https://before.example.test",
-        }),
-      ).resolves.toEqual({ status: "rejected", statusCode: 403 });
-      expect(
-        (
-          await fetch(`http://127.0.0.1:${target.port}/mcp/agents`, {
-            method: "POST",
-          })
-        ).status,
-      ).toBe(404);
+      expect(await afterProxyReload.text()).toBe("http");
       expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
-        concurrencyLimit: 1,
-        maxProcessesPerSecond: 5,
+        concurrencyLimit: 8,
+        maxProcessesPerSecond: 64,
       });
-      await expect(
-        daemon.agentManager.createAgent({ provider: "codex", cwd: agentCwd }, undefined, {
-          workspaceId: undefined,
-        }),
-      ).rejects.toThrow(/disabled/i);
-      expect((await client.getDaemonStatus()).relay?.enabled).toBe(true);
-      expect((await client.getDaemonPairingOffer()).url).toContain(
-        "https://after.example.test/#offer=",
-      );
     } finally {
       configureGitProcessPolicy(DEFAULT_GIT_PROCESS_POLICY);
       await client?.close().catch(() => undefined);
@@ -438,7 +496,7 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
-  test("relay config changes during Hub enrollment reach the live runtime", async () => {
+  test("restricted mode denies relay config changes during Hub enrollment", async () => {
     const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-relay-startup-"));
     const paseoHome = path.join(paseoHomeRoot, ".paseo");
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
@@ -519,12 +577,11 @@ describe("paseo daemon bootstrap", () => {
         appVersion: "0.1.82",
       });
       await client.connect();
-      await client.patchDaemonConfig({ relay: { enabled: true } });
+      await expect(client.patchDaemonConfig({ relay: { enabled: true } })).rejects.toMatchObject({
+        code: "access_denied",
+      });
       releaseEnrollment();
       await starting;
-
-      const status = await client.getDaemonStatus();
-      expect(status.relay?.enabled).toBe(true);
     } finally {
       releaseEnrollment();
       await starting.catch(() => undefined);

@@ -948,10 +948,11 @@ export async function createPaseoDaemon(
       });
     },
   });
-  await workspaceReconciliation.start();
-  void workspaceReconciliation.reconcileNow().catch((error) => {
-    logger.warn({ err: error }, "Initial workspace reconciliation failed");
-  });
+  // Maya's restricted build receives one generation-bound workspace catalog
+  // from the root-managed host integration. Reconciliation writes those files
+  // outside Maya's catalog lock and would invalidate that committed generation,
+  // so this downstream build deliberately never starts its mutation watchers or
+  // boot-time rescan. The service remains constructed only for uniform teardown.
   const checkoutDiffManager = new CheckoutDiffManager({
     logger,
     paseoHome: config.paseoHome,

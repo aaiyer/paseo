@@ -75,7 +75,7 @@ import type { ForgeService } from "../services/forge-service.js";
 import {
   extractWsBearerProtocol,
   extractWsBearerToken,
-  isBearerTokenValid,
+  BoundedDaemonPasswordVerifier,
   type DaemonAuthConfig,
 } from "./auth.js";
 import {
@@ -98,7 +98,10 @@ import {
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
-import { evaluateMayaRestrictedSessionMessage } from "./maya-restricted-mode.js";
+import {
+  evaluateMayaRestrictedSessionMessage,
+  evaluateMayaRestrictedWorkspaceReadIdentity,
+} from "./maya-restricted-mode.js";
 import {
   APPLICATION_SOCKET_LEASE_CHECK_INTERVAL_MS,
   ApplicationSocketLease,
@@ -605,6 +608,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly directorySync = new DirectorySyncService();
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
+  private readonly passwordVerifier = new BoundedDaemonPasswordVerifier();
 
   constructor(
     server: HTTPServer,
@@ -907,11 +911,20 @@ export class VoiceAssistantWebSocketServer {
       const requestMetadata = extractSocketRequestMetadata(request);
       const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
       const token = extractWsBearerToken(protocol);
-      const isAuthorized = isBearerTokenValid({ password, token });
-      if (!isAuthorized) {
-        const reason = token === null ? "Password required" : "Incorrect password";
+      const verification = await this.passwordVerifier.verify({
+        password,
+        token,
+        peer: requestMetadata.remoteAddress ?? "unknown",
+      });
+      if (verification !== "authorized") {
+        const reason =
+          verification === "busy" || verification === "rate_limited"
+            ? "Too many authentication attempts"
+            : token === null
+              ? "Password required"
+              : "Incorrect password";
         this.logger.warn(
-          { ...requestMetadata, hasToken: token !== null },
+          { ...requestMetadata, hasToken: token !== null, verification },
           "Rejected WebSocket connection with invalid daemon password",
         );
         ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, reason);
@@ -1044,6 +1057,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   public async close(): Promise<void> {
+    this.passwordVerifier.dispose();
     this.prepareForShutdown();
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
@@ -2256,10 +2270,17 @@ export class VoiceAssistantWebSocketServer {
     message: Extract<WSInboundMessage, { type: "session" }>,
   ): Promise<void> {
     this.recordInboundSessionRequestType(message.message.type);
-    const restrictedDecision = evaluateMayaRestrictedSessionMessage(
+    const restrictedWorkspaces = await this.workspaceRegistry.list();
+    let restrictedDecision = evaluateMayaRestrictedSessionMessage(
       message.message,
-      await this.workspaceRegistry.list(),
+      restrictedWorkspaces,
     );
+    if (restrictedDecision.allowed) {
+      restrictedDecision = await evaluateMayaRestrictedWorkspaceReadIdentity(
+        message.message,
+        restrictedWorkspaces,
+      );
+    }
     if (!restrictedDecision.allowed) {
       const requestId = "requestId" in message.message ? message.message.requestId : undefined;
       activeConnection.connectionLogger.warn(

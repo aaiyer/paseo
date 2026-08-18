@@ -1,8 +1,132 @@
 import { compare, compareSync, hashSync } from "bcryptjs";
 import { timingSafeEqual } from "node:crypto";
+import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import type { RequestHandler } from "express";
 
 export const DAEMON_PASSWORD_BCRYPT_COST = 12;
+const WS_AUTH_MAX_PENDING = 4;
+const WS_AUTH_MAX_ATTEMPTS_PER_WINDOW = 8;
+const WS_AUTH_ATTEMPT_WINDOW_MS = 10_000;
+const WS_AUTH_MAX_TRACKED_PEERS = 1024;
+const BCRYPT_MODULE_PATH = createRequire(import.meta.url).resolve("bcryptjs");
+const BCRYPT_WORKER_SOURCE = String.raw`
+const { parentPort, workerData } = require("node:worker_threads");
+const { compareSync } = require(workerData.bcryptModulePath);
+parentPort.on("message", ({ id, token, password }) => {
+  try {
+    parentPort.postMessage({ id, valid: compareSync(token, password) });
+  } catch (error) {
+    parentPort.postMessage({ id, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+`;
+
+export type BoundedPasswordVerificationResult = "authorized" | "invalid" | "busy" | "rate_limited";
+
+interface PasswordWorkerResponse {
+  id: number;
+  valid?: boolean;
+  error?: string;
+}
+
+interface PendingPasswordVerification {
+  resolve: (result: BoundedPasswordVerificationResult) => void;
+}
+
+interface PeerAttemptWindow {
+  startedAt: number;
+  attempts: number;
+}
+
+/** Fixed-capacity, off-main-thread verifier for pre-authenticated WebSockets. */
+export class BoundedDaemonPasswordVerifier {
+  private worker: Worker | null = null;
+  private nextId = 1;
+  private readonly pending = new Map<number, PendingPasswordVerification>();
+  private readonly peerAttempts = new Map<string, PeerAttemptWindow>();
+  private disposed = false;
+
+  async verify(input: {
+    password: string | undefined;
+    token: string | null;
+    peer: string;
+  }): Promise<BoundedPasswordVerificationResult> {
+    if (!input.password) return "authorized";
+    if (!this.admitPeer(input.peer)) return "rate_limited";
+    if (input.token === null) return "invalid";
+    if (this.disposed || this.pending.size >= WS_AUTH_MAX_PENDING) return "busy";
+
+    const worker = this.ensureWorker();
+    const id = this.nextId;
+    this.nextId += 1;
+    return new Promise((resolve) => {
+      this.pending.set(id, { resolve });
+      try {
+        worker.postMessage({ id, token: input.token, password: input.password });
+      } catch {
+        this.pending.delete(id);
+        resolve("busy");
+      }
+    });
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    const worker = this.worker;
+    this.worker = null;
+    void worker?.terminate();
+    this.resolveAllPending("busy");
+    this.peerAttempts.clear();
+  }
+
+  private admitPeer(peer: string): boolean {
+    const now = Date.now();
+    const existing = this.peerAttempts.get(peer);
+    if (!existing || now - existing.startedAt >= WS_AUTH_ATTEMPT_WINDOW_MS) {
+      if (!existing && this.peerAttempts.size >= WS_AUTH_MAX_TRACKED_PEERS) {
+        const oldest = this.peerAttempts.keys().next().value as string | undefined;
+        if (oldest !== undefined) this.peerAttempts.delete(oldest);
+      }
+      this.peerAttempts.set(peer, { startedAt: now, attempts: 1 });
+      return true;
+    }
+    existing.attempts += 1;
+    return existing.attempts <= WS_AUTH_MAX_ATTEMPTS_PER_WINDOW;
+  }
+
+  private ensureWorker(): Worker {
+    if (this.worker) return this.worker;
+    const worker = new Worker(BCRYPT_WORKER_SOURCE, {
+      eval: true,
+      workerData: { bcryptModulePath: BCRYPT_MODULE_PATH },
+    });
+    worker.unref();
+    worker.on("message", (message: PasswordWorkerResponse) => {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      pending.resolve(message.error ? "invalid" : message.valid ? "authorized" : "invalid");
+    });
+    worker.on("error", () => {
+      if (this.worker !== worker) return;
+      this.worker = null;
+      this.resolveAllPending("busy");
+    });
+    worker.on("exit", () => {
+      if (this.worker !== worker) return;
+      this.worker = null;
+      this.resolveAllPending("busy");
+    });
+    this.worker = worker;
+    return worker;
+  }
+
+  private resolveAllPending(result: BoundedPasswordVerificationResult): void {
+    for (const pending of this.pending.values()) pending.resolve(result);
+    this.pending.clear();
+  }
+}
 
 export interface DaemonAuthConfig {
   password?: string;

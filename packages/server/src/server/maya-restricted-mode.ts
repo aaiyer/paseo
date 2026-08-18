@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+
 import type { SessionInboundMessage } from "./messages.js";
 import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 
@@ -48,12 +52,11 @@ export interface MayaRestrictedModeDecision {
   reason: string;
 }
 
-type RestrictedWorkspace = Pick<
-  PersistedWorkspaceRecord,
-  "workspaceId" | "cwd" | "archivedAt"
->;
+type RestrictedWorkspace = Pick<PersistedWorkspaceRecord, "workspaceId" | "cwd" | "archivedAt">;
 
 const ALLOWED = { allowed: true, reason: "allowed" } as const;
+const MAYA_WORKSPACE_IDENTITY_DOMAIN = "maya-paseo-workspace-identity-v1";
+const MAX_GIT_LINK_BYTES = 4096;
 
 function denied(reason: string): MayaRestrictedModeDecision {
   return { allowed: false, reason };
@@ -79,6 +82,128 @@ function evaluateRegisteredCwd(
   return isActiveWorkspaceCwd(cwd, workspaces)
     ? ALLOWED
     : denied("cwd is not an active pre-registered workspace");
+}
+
+export function isMayaRestrictedWorkspaceReadRequest(
+  message: SessionInboundMessage,
+): message is Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | "checkout_status_request"
+      | "subscribe_checkout_diff_request"
+      | "checkout.commits.list.request"
+      | "checkout.commits.file_diff.request"
+      | "checkout.refresh.request"
+      | "file_explorer_request"
+      | "fs.file.subscribe.request";
+  }
+> {
+  switch (message.type) {
+    case "checkout_status_request":
+    case "subscribe_checkout_diff_request":
+    case "checkout.commits.list.request":
+    case "checkout.commits.file_diff.request":
+    case "checkout.refresh.request":
+    case "file_explorer_request":
+    case "fs.file.subscribe.request":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** Recomputes the exact host-catalog identity from the live checkout. */
+export async function deriveMayaRestrictedWorkspaceId(cwd: string): Promise<string> {
+  const root = await fs.realpath(cwd);
+  if (root !== path.resolve(cwd)) {
+    throw new Error("workspace root is not canonical");
+  }
+  const rootMetadata = await fs.lstat(root, { bigint: true });
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+    throw new Error("workspace root is not a real directory");
+  }
+
+  const dotGit = path.join(root, ".git");
+  const dotGitMetadata = await fs.lstat(dotGit, { bigint: true });
+  let commonDirectory: string;
+  if (dotGitMetadata.isDirectory() && !dotGitMetadata.isSymbolicLink()) {
+    commonDirectory = await fs.realpath(dotGit);
+  } else if (dotGitMetadata.isFile() && !dotGitMetadata.isSymbolicLink()) {
+    const gitDirectory = await readBoundedGitPathFile(dotGit, "gitdir: ", root);
+    const commondir = path.join(gitDirectory, "commondir");
+    commonDirectory = await readBoundedGitPathFile(commondir, "", gitDirectory);
+  } else {
+    throw new Error("workspace .git entry is unsafe");
+  }
+
+  const canonicalCommonDirectory = await fs.realpath(commonDirectory);
+  const commonMetadata = await fs.lstat(canonicalCommonDirectory, { bigint: true });
+  if (!commonMetadata.isDirectory() || commonMetadata.isSymbolicLink()) {
+    throw new Error("Git common directory is unsafe");
+  }
+  const finalRootMetadata = await fs.lstat(root, { bigint: true });
+  if (
+    !finalRootMetadata.isDirectory() ||
+    finalRootMetadata.dev !== rootMetadata.dev ||
+    finalRootMetadata.ino !== rootMetadata.ino
+  ) {
+    throw new Error("workspace root changed during identity validation");
+  }
+
+  const digest = createHash("sha256");
+  for (const field of [
+    MAYA_WORKSPACE_IDENTITY_DOMAIN,
+    root,
+    `${rootMetadata.dev}:${rootMetadata.ino}`,
+    canonicalCommonDirectory,
+    `${commonMetadata.dev}:${commonMetadata.ino}`,
+  ]) {
+    digest.update(field);
+    digest.update("\0");
+  }
+  return `wks_${digest.digest("hex").slice(0, 16)}`;
+}
+
+async function readBoundedGitPathFile(
+  filePath: string,
+  prefix: string,
+  relativeTo: string,
+): Promise<string> {
+  const metadata = await fs.lstat(filePath, { bigint: true });
+  if (
+    !metadata.isFile() ||
+    metadata.isSymbolicLink() ||
+    metadata.size === 0n ||
+    metadata.size > BigInt(MAX_GIT_LINK_BYTES)
+  ) {
+    throw new Error("Git path indirection is unsafe");
+  }
+  const raw = await fs.readFile(filePath, "utf8");
+  if (raw.includes("\0")) throw new Error("Git path indirection is malformed");
+  const value = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  if (value.includes("\n") || !value.startsWith(prefix) || value.length === prefix.length) {
+    throw new Error("Git path indirection is malformed");
+  }
+  return fs.realpath(path.resolve(relativeTo, value.slice(prefix.length)));
+}
+
+export async function evaluateMayaRestrictedWorkspaceReadIdentity(
+  message: SessionInboundMessage,
+  workspaces: readonly RestrictedWorkspace[],
+): Promise<MayaRestrictedModeDecision> {
+  if (!isMayaRestrictedWorkspaceReadRequest(message)) return ALLOWED;
+  const workspace = workspaces.find(
+    (candidate) => candidate.archivedAt === null && candidate.cwd === message.cwd,
+  );
+  if (!workspace) return denied("cwd is not an active pre-registered workspace");
+  try {
+    return (await deriveMayaRestrictedWorkspaceId(message.cwd)) === workspace.workspaceId
+      ? ALLOWED
+      : denied("workspace filesystem identity no longer matches the catalog");
+  } catch {
+    return denied("workspace filesystem identity cannot be validated");
+  }
 }
 
 function hasOnlyCodexProviders(providers: readonly string[] | undefined): boolean {
@@ -123,9 +248,7 @@ export function evaluateMayaRestrictedSessionMessage(
         : denied("cancellation requires the active nonempty turn id");
 
     case "close_items_request":
-      return message.terminalIds.length === 0
-        ? ALLOWED
-        : denied("terminal lifecycle is disabled");
+      return message.terminalIds.length === 0 ? ALLOWED : denied("terminal lifecycle is disabled");
 
     case "agent_permission_response":
       if (message.response.behavior === "allow") {
@@ -186,22 +309,16 @@ export function evaluateMayaRestrictedSessionMessage(
       if (message.provider !== "codex") {
         return denied("only the Codex provider is enabled");
       }
-      return message.cwd === undefined
-        ? ALLOWED
-        : evaluateRegisteredCwd(message.cwd, workspaces);
+      return message.cwd === undefined ? ALLOWED : evaluateRegisteredCwd(message.cwd, workspaces);
 
     case "get_providers_snapshot_request":
-      return message.cwd === undefined
-        ? ALLOWED
-        : evaluateRegisteredCwd(message.cwd, workspaces);
+      return message.cwd === undefined ? ALLOWED : evaluateRegisteredCwd(message.cwd, workspaces);
 
     case "refresh_providers_snapshot_request":
       if (!hasOnlyCodexProviders(message.providers)) {
         return denied("only the Codex provider is enabled");
       }
-      return message.cwd === undefined
-        ? ALLOWED
-        : evaluateRegisteredCwd(message.cwd, workspaces);
+      return message.cwd === undefined ? ALLOWED : evaluateRegisteredCwd(message.cwd, workspaces);
 
     case "provider_diagnostic_request":
       return message.provider === "codex" ? ALLOWED : denied("only the Codex provider is enabled");
@@ -219,9 +336,7 @@ export function evaluateMayaRestrictedSessionMessage(
       return ALLOWED;
 
     case "client_heartbeat":
-      return message.focusedTerminalId === null
-        ? ALLOWED
-        : denied("terminal focus is disabled");
+      return message.focusedTerminalId === null ? ALLOWED : denied("terminal focus is disabled");
 
     case "list_commands_request":
       return message.draftConfig === undefined
