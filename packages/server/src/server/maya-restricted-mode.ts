@@ -78,6 +78,13 @@ export interface MayaRestrictedWorkspaceAuthority {
   retain(): MayaRestrictedWorkspaceAuthority;
   release(): Promise<void>;
   isCurrent(): Promise<boolean>;
+  terminalSandboxBinding(): Promise<MayaRestrictedTerminalSandboxBinding>;
+}
+
+export interface MayaRestrictedTerminalSandboxBinding {
+  readonly workspaceRoot: string;
+  readonly rootDevice: bigint;
+  readonly rootInode: bigint;
 }
 
 class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAuthority {
@@ -140,6 +147,17 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
     } catch {
       return false;
     }
+  }
+
+  async terminalSandboxBinding(): Promise<MayaRestrictedTerminalSandboxBinding> {
+    await this.validateGitAssociation();
+    const metadata = await this.rootHandle.stat({ bigint: true });
+    if (!metadata.isDirectory()) throw new Error("workspace root authority is not a directory");
+    return {
+      workspaceRoot: this.cwd,
+      rootDevice: metadata.dev,
+      rootInode: metadata.ino,
+    };
   }
 
   async validateGitAssociation(): Promise<void> {

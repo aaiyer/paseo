@@ -423,6 +423,49 @@ describe("CheckoutSession", () => {
       ]);
     });
 
+    it("never resolves or invalidates Forge for a restricted status or refresh", async () => {
+      const getSnapshot = vi.fn(async (cwd: string) => createNoGitWorkspaceRuntimeSnapshot(cwd));
+      const resolveForge = vi.fn(async () => {
+        throw new Error("restricted checkout attempted Forge resolution");
+      });
+      const invalidate = vi.fn(() => {
+        throw new Error("restricted checkout attempted Forge invalidation");
+      });
+      const { checkout, emitted } = makeCheckoutSession({
+        git: { getSnapshot, resolveForge },
+        github: { invalidate },
+      });
+      const authority = {
+        rootAccessPath: "/proc/self/fd/41",
+      } as unknown as Awaited<ReturnType<typeof openMayaRestrictedWorkspaceAuthority>>;
+
+      await checkout.handleStatusRequest(
+        { type: "checkout_status_request", cwd: "/repo", requestId: "status" },
+        authority,
+      );
+      await checkout.handleRefreshRequest(
+        { type: "checkout.refresh.request", cwd: "/repo", requestId: "refresh" },
+        authority,
+      );
+
+      expect(getSnapshot).toHaveBeenNthCalledWith(1, "/proc/self/fd/41", {
+        includeForge: false,
+      });
+      expect(getSnapshot).toHaveBeenNthCalledWith(2, "/proc/self/fd/41", {
+        force: true,
+        includeForge: false,
+        reason: "manual-refresh",
+      });
+      expect(resolveForge).not.toHaveBeenCalled();
+      expect(invalidate).not.toHaveBeenCalled();
+      expect(emitted).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "checkout_status_response" }),
+          expect.objectContaining({ type: "checkout.refresh.response" }),
+        ]),
+      );
+    });
+
     it("expands a tilde cwd before refreshing git and diffs", async () => {
       const snapshotCalls: string[] = [];
       const { subscriber, refreshedCwds } = createFakeDiffSubscriber({

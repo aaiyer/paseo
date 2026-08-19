@@ -64,6 +64,11 @@ export interface TerminalManager {
     cols?: number;
     activityToken?: string;
     activityUrl?: string | null;
+    mayaRestrictedSandbox?: {
+      workspaceRoot: string;
+      rootDevice: bigint;
+      rootInode: bigint;
+    };
   }): Promise<TerminalSession>;
   registerCwdEnv(options: { cwd: string; env: Record<string, string> }): void;
   validateTerminalActivityToken(terminalId: string, token: string): "valid" | "unknown" | "invalid";
@@ -321,6 +326,11 @@ export function createTerminalManager(
       cols?: number;
       activityToken?: string;
       activityUrl?: string | null;
+      mayaRestrictedSandbox?: {
+        workspaceRoot: string;
+        rootDevice: bigint;
+        rootInode: bigint;
+      };
     }): Promise<TerminalSession> {
       assertAbsolutePath(options.cwd);
 
@@ -355,6 +365,9 @@ export function createTerminalManager(
             ...(options.rows !== undefined ? { rows: options.rows } : {}),
             ...(options.cols !== undefined ? { cols: options.cols } : {}),
             ...(mergedEnv ? { env: mergedEnv } : {}),
+            ...(options.mayaRestrictedSandbox
+              ? { mayaRestrictedSandbox: options.mayaRestrictedSandbox }
+              : {}),
             activityEnv,
           }),
         );

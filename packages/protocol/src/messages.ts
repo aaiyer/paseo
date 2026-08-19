@@ -5765,6 +5765,7 @@ export const KillTerminalResponseSchema = z.object({
   payload: z.object({
     terminalId: z.string(),
     success: z.boolean(),
+    error: z.string().nullable().optional(),
     requestId: z.string(),
   }),
 });
@@ -5775,6 +5776,7 @@ export const CaptureTerminalResponseSchema = z.object({
     terminalId: z.string(),
     lines: z.array(z.string()),
     totalLines: z.number().int().nonnegative(),
+    error: z.string().nullable().optional(),
     requestId: z.string(),
   }),
 });

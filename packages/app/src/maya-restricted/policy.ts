@@ -10,14 +10,34 @@ const RETAINED_COMMANDS = new Set([
 ]);
 
 const RETAINED_HOST_PATHS = ["/workspace/", "/agent/", "/sessions"] as const;
-const DENIED_GLOBAL_PATHS = [
-  "/welcome",
-  "/settings",
-  "/new",
-  "/open-project",
-  "/schedules",
-  "/pair-scan",
-] as const;
+export interface MayaRestrictedAppComposition {
+  readonly offerLinks: boolean;
+  readonly openProjectEvents: boolean;
+  readonly pluginCommands: boolean;
+  readonly projectMutation: boolean;
+  readonly providerSettings: boolean;
+  readonly setupAndDiagnostics: boolean;
+  readonly downloads: boolean;
+  readonly selectedWorkspaceTerminal: boolean;
+  readonly threadAndReadSurfaces: boolean;
+}
+
+export function resolveMayaRestrictedAppComposition(
+  mayaRestricted: boolean,
+): MayaRestrictedAppComposition {
+  const ordinaryOnly = !mayaRestricted;
+  return {
+    offerLinks: ordinaryOnly,
+    openProjectEvents: ordinaryOnly,
+    pluginCommands: ordinaryOnly,
+    projectMutation: ordinaryOnly,
+    providerSettings: ordinaryOnly,
+    setupAndDiagnostics: ordinaryOnly,
+    downloads: ordinaryOnly,
+    selectedWorkspaceTerminal: true,
+    threadAndReadSurfaces: true,
+  };
+}
 
 export function isMayaRestrictedServerInfo(
   serverInfo: DaemonServerInfo | null | undefined,
@@ -56,15 +76,9 @@ export function resolveMayaRestrictedRouteRedirect(input: {
     return `/h/${encodeURIComponent(serverId)}`;
   }
 
-  if (input.restrictedServerIds.length === 0) return null;
-  if (
-    !DENIED_GLOBAL_PATHS.some(
-      (prefix) => input.pathname === prefix || input.pathname.startsWith(`${prefix}/`),
-    )
-  ) {
-    return null;
-  }
-  return `/h/${encodeURIComponent(input.restrictedServerIds[0])}`;
+  // A global route has no routed server authority. A connected restricted
+  // session must not disable an ordinary server's app surface.
+  return null;
 }
 
 export function isMayaRestrictedShortcutActionAllowed(action: {

@@ -231,6 +231,9 @@ export async function listDirectoryEntries({
       dirents,
       DIRECTORY_ENTRY_OPEN_CONCURRENCY,
       async (dirent) => {
+        if (!dirent.isFile() && !dirent.isDirectory() && !dirent.isSymbolicLink()) {
+          return null;
+        }
         const targetPath = path.join(opened.scoped.requestedPath, dirent.name);
         const kind: ExplorerEntryKind = dirent.isDirectory() ? "directory" : "file";
         try {
@@ -972,7 +975,10 @@ async function buildDescriptorBoundEntryPayload({
   name,
   kind,
 }: EntryPayloadParams & { descriptorPath: string }): Promise<FileExplorerEntry> {
-  const handle = await fs.open(path.join(descriptorPath, name), constants.O_RDONLY);
+  const handle = await fs.open(
+    path.join(descriptorPath, name),
+    constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NONBLOCK),
+  );
   let hookOpened = false;
   try {
     const hook = directoryEntryOpenHookForTest;
@@ -982,6 +988,9 @@ async function buildDescriptorBoundEntryPayload({
     }
     await validateOpenedPathWithinRoot(handle, root);
     const stats = await handle.stat();
+    if (!stats.isFile() && !stats.isDirectory()) {
+      throw new Error("Directory entry is not a regular file or directory");
+    }
     return {
       name,
       path: normalizeRelativePath({ root, targetPath }),

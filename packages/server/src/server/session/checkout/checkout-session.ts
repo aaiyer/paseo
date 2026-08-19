@@ -239,7 +239,9 @@ export class CheckoutSession {
     const resolvedCwd = authority?.rootAccessPath ?? expandTilde(cwd);
 
     try {
-      const snapshot = await this.workspaceGitService.getSnapshot(resolvedCwd);
+      const snapshot = authority
+        ? await this.workspaceGitService.getSnapshot(resolvedCwd, { includeForge: false })
+        : await this.workspaceGitService.getSnapshot(resolvedCwd);
       this.host.emit({
         type: "checkout_status_response",
         payload: buildCheckoutStatusPayloadFromSnapshot({
@@ -496,10 +498,12 @@ export class CheckoutSession {
     const resolvedCwd = authority?.rootAccessPath ?? expandTilde(cwd);
 
     try {
-      (await this.resolveForgeService(resolvedCwd))?.service.invalidate({ cwd: resolvedCwd });
+      if (!authority) {
+        (await this.resolveForgeService(resolvedCwd))?.service.invalidate({ cwd: resolvedCwd });
+      }
       await this.workspaceGitService.getSnapshot(resolvedCwd, {
         force: true,
-        includeForge: true,
+        includeForge: authority ? false : true,
         reason: "manual-refresh",
       });
       this.checkoutDiffManager.scheduleRefreshForCwd(resolvedCwd);

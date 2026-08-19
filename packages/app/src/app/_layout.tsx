@@ -2,6 +2,7 @@ import "@/styles/unistyles";
 import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import { PortalProvider } from "@gorhom/portal";
 import { QueryClientProvider } from "@tanstack/react-query";
+import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
 import { Redirect, Stack, useNavigationContainerRef, usePathname, useRouter } from "expo-router";
 import {
@@ -42,7 +43,7 @@ import { RootErrorBoundary } from "@/components/root-error-boundary";
 import { WorkspaceSetupDialog } from "@/components/workspace-setup-dialog";
 import { WorkspaceShortcutTargetsSubscriber } from "@/components/workspace-shortcut-targets-subscriber";
 import { FloatingPanelPortalHost } from "@/components/ui/floating-panel-portal";
-import { HostChooserModal } from "@/hosts/host-chooser";
+import { HostChooserModal, useHostChooser } from "@/hosts/host-chooser";
 import {
   getIsElectronRuntime,
   HEADER_INNER_HEIGHT,
@@ -73,6 +74,7 @@ import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { AgentNavigationListener } from "@/desktop/agent-navigation";
 import { LegacyAgentSkillsMigration } from "@/agent-skills/legacy-migration";
 import { legacyFavoriteProfileMigration } from "@/agent-profiles/migration";
+import { listenToDesktopEvent } from "@/desktop/electron/events";
 import { updateDesktopWindowControls } from "@/desktop/electron/window";
 import { getDesktopHost } from "@/desktop/host";
 import { loadDesktopSettings } from "@/desktop/settings/desktop-settings";
@@ -85,6 +87,7 @@ import { useFaviconStatus } from "@/hooks/use-favicon-status";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { KeyboardShiftProvider } from "@/hooks/use-keyboard-shift-style";
 import { useCompactWebViewportZoomLock } from "@/hooks/use-compact-web-viewport-zoom-lock";
+import { useOpenProject } from "@/hooks/use-open-project";
 import { useAppSettings } from "@/hooks/use-settings";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useOpenAgentListGesture } from "@/mobile-panels/gestures";
@@ -100,6 +103,8 @@ import { queryClient } from "@/data/query-client";
 import {
   getHostRuntimeStore,
   hasConfiguredLocalDaemonOverride,
+  useHostMutations,
+  useHostRegistryLoaded,
   useHostRuntimeClient,
   useHostRuntimeIsConnected,
   useHosts,
@@ -129,6 +134,7 @@ import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { PluginCatalogSync } from "@/plugins";
 import {
   isMayaRestrictedServerInfo,
+  resolveMayaRestrictedAppComposition,
   resolveMayaRestrictedRouteRedirect,
 } from "@/maya-restricted/policy";
 import {
@@ -472,6 +478,14 @@ interface AppContainerProps {
 
 const WINDOW_SIDEBAR_TOGGLE_HORIZONTAL_PADDING = 12;
 
+function useMayaRestrictedRoutedServer(): boolean {
+  const pathname = usePathname();
+  const routeServerId = useMemo(() => parseServerIdFromPathname(pathname), [pathname]);
+  return useSessionStore((state) =>
+    routeServerId ? isMayaRestrictedServerInfo(state.sessions[routeServerId]?.serverInfo) : false,
+  );
+}
+
 function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppContainerProps) {
   const keyboardActionDispatcher = useKeyboardActionDispatcher();
   const daemons = useHosts();
@@ -496,14 +510,8 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
   const isCompactLayout = useIsCompactFormFactor();
   useCompactWebViewportZoomLock(isCompactLayout);
   const pathname = usePathname();
-  const routeServerId = useMemo(() => parseServerIdFromPathname(pathname), [pathname]);
-  const mayaRestricted = useSessionStore((state) =>
-    routeServerId
-      ? isMayaRestrictedServerInfo(state.sessions[routeServerId]?.serverInfo)
-      : Object.values(state.sessions).some((session) =>
-          isMayaRestrictedServerInfo(session?.serverInfo),
-        ),
-  );
+  const mayaRestricted = useMayaRestrictedRoutedServer();
+  const composition = resolveMayaRestrictedAppComposition(mayaRestricted);
   const isWorkspaceRoute = parseHostWorkspaceRouteFromPathname(pathname) !== null;
   const isWorkspaceFocusModeEnabled = isWorkspaceRoute && isFocusModeEnabled;
   const chromeEnabled = chromeEnabledOverride ?? daemons.length > 0;
@@ -618,22 +626,22 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
       ) : null}
       <FloatingPanelPortalHost />
       {isCompactLayout ? sidebarChrome : null}
-      {!mayaRestricted ? <DownloadToast /> : null}
+      {composition.downloads ? <DownloadToast /> : null}
       {!mayaRestricted ? <RosettaCalloutSource /> : null}
       {!mayaRestricted ? <UpdateCalloutSource /> : null}
       {!mayaRestricted ? <LegacyAgentSkillsMigration /> : null}
       {!mayaRestricted ? <WorktreeSetupCalloutSource /> : null}
       <CommandCenterRootActions />
       <CommandCenterWorkspaceActions />
-      {!mayaRestricted ? <PluginCommandCenterActions /> : null}
+      {composition.pluginCommands ? <PluginCommandCenterActions /> : null}
       {!mayaRestricted ? <WorkspacePinShortcutHandler /> : null}
       <CommandCenter />
-      {!mayaRestricted ? <AddProjectFlowHost /> : null}
+      {composition.projectMutation ? <AddProjectFlowHost /> : null}
       {!mayaRestricted ? <HostChooserModal /> : null}
-      {!mayaRestricted ? <ProviderSettingsHost /> : null}
-      {!mayaRestricted ? <WorkspaceSetupDialog /> : null}
+      {composition.providerSettings ? <ProviderSettingsHost /> : null}
+      {composition.setupAndDiagnostics ? <WorkspaceSetupDialog /> : null}
       {!mayaRestricted ? <KeyboardShortcutsDialog /> : null}
-      {!mayaRestricted ? <AppDiagnosticHost /> : null}
+      {composition.setupAndDiagnostics ? <AppDiagnosticHost /> : null}
       <QuittingOverlay />
     </View>
   );
@@ -689,6 +697,9 @@ function MobileGestureWrapper({
 
 function ProvidersWrapper({ children }: { children: ReactNode }) {
   const { settings, isLoading: settingsLoading } = useAppSettings();
+  const { upsertConnectionFromOfferUrl } = useHostMutations();
+  const mayaRestricted = useMayaRestrictedRoutedServer();
+  const composition = resolveMayaRestrictedAppComposition(mayaRestricted);
 
   // Apply theme setting on mount and when it changes
   useEffect(() => {
@@ -725,11 +736,133 @@ function ProvidersWrapper({ children }: { children: ReactNode }) {
   return (
     <VoiceProvider>
       <DesktopWindowControlsSync enabled={!settingsLoading} />
+      {composition.offerLinks ? (
+        <OfferLinkListener upsertDaemonFromOfferUrl={upsertConnectionFromOfferUrl} />
+      ) : null}
       <HostSessionManager />
       <FaviconStatusSync />
       <AppearanceStyleBoundary>{children}</AppearanceStyleBoundary>
     </VoiceProvider>
   );
+}
+
+function OfferLinkListener({
+  upsertDaemonFromOfferUrl,
+}: {
+  upsertDaemonFromOfferUrl: (offerUrlOrFragment: string) => Promise<unknown>;
+}) {
+  const router = useRouter();
+
+  useEffect(() => {
+    let cancelled = false;
+    const handleUrl = (url: string | null) => {
+      if (!url?.includes("#offer=")) return;
+      void upsertDaemonFromOfferUrl(url)
+        .then((profile) => {
+          if (cancelled) return;
+          const serverId = (profile as { serverId?: unknown } | null)?.serverId;
+          if (typeof serverId !== "string" || !serverId) return;
+          router.replace(buildOpenProjectRoute());
+        })
+        .catch((error) => {
+          if (!cancelled) console.warn("[Linking] Failed to import pairing offer", error);
+        });
+    };
+
+    void Linking.getInitialURL()
+      .then(handleUrl)
+      .catch(() => undefined);
+    const subscription = Linking.addEventListener("url", (event) => handleUrl(event.url));
+    return () => {
+      cancelled = true;
+      subscription.remove();
+    };
+  }, [router, upsertDaemonFromOfferUrl]);
+
+  return null;
+}
+
+interface OpenProjectEventPayload {
+  path?: unknown;
+}
+
+interface PendingOpenProjectRequest {
+  id: number;
+  serverId: string;
+  path: string;
+}
+
+let nextOpenProjectRequestId = 1;
+
+function OpenProjectListener() {
+  const chooseHost = useHostChooser();
+  const hostRegistryLoaded = useHostRegistryLoaded();
+  const [request, setRequest] = useState<PendingOpenProjectRequest | null>(null);
+  const [pendingPath, setPendingPath] = useState<string | null>(null);
+  const openProject = useOpenProject(request?.serverId ?? null);
+
+  const openPathOnChosenHost = useCallback(
+    (path: string) => {
+      const nextPath = path.trim();
+      if (!nextPath) return;
+      if (!hostRegistryLoaded) {
+        setPendingPath(nextPath);
+        return;
+      }
+      chooseHost({
+        title: "Choose host",
+        onChooseHost: (serverId) => {
+          setRequest({ id: nextOpenProjectRequestId++, serverId, path: nextPath });
+        },
+      });
+    },
+    [chooseHost, hostRegistryLoaded],
+  );
+
+  useEffect(() => {
+    if (!hostRegistryLoaded || !pendingPath) return;
+    const nextPath = pendingPath;
+    setPendingPath(null);
+    openPathOnChosenHost(nextPath);
+  }, [hostRegistryLoaded, openPathOnChosenHost, pendingPath]);
+
+  useEffect(() => {
+    if (!request) return;
+    let cancelled = false;
+    void openProject(request.path).then(() => {
+      if (!cancelled) setRequest((current) => (current?.id === request.id ? null : current));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [openProject, request]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void getDesktopHost()
+      ?.getPendingOpenProject?.()
+      ?.then((pending) => {
+        if (!disposed && pending) openPathOnChosenHost(pending);
+      })
+      .catch(() => undefined);
+    void listenToDesktopEvent<OpenProjectEventPayload>("open-project", (payload) => {
+      if (!disposed) {
+        openPathOnChosenHost(typeof payload?.path === "string" ? payload.path : "");
+      }
+    })
+      .then((dispose) => {
+        if (disposed) dispose();
+        else unlisten = dispose;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [openPathOnChosenHost]);
+
+  return null;
 }
 
 function DesktopWindowControlsSync({ enabled }: { enabled: boolean }) {
@@ -828,9 +961,12 @@ function WorkspaceRouteNavigationBridge() {
 }
 
 function AppShell() {
+  const mayaRestricted = useMayaRestrictedRoutedServer();
+  const composition = resolveMayaRestrictedAppComposition(mayaRestricted);
   return (
     <MobilePanelsProvider>
       <HorizontalScrollProvider>
+        {composition.openProjectEvents ? <OpenProjectListener /> : null}
         <AgentNavigationListener />
         <AppWithSidebar>
           <MayaRestrictedRouteGuard />

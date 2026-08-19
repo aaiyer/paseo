@@ -14,8 +14,10 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -1252,6 +1254,60 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       expect(scrollbackText).toContain("3");
     });
   });
+
+  describe.skipIf(!isPlatform("linux") || !existsSync("/usr/bin/bwrap"))(
+    "Maya restricted terminal sandbox",
+    () => {
+      it("keeps only the selected registered workspace writable and has no network", async () => {
+        const workspace = mkdtempSync(join(tmpdir(), "paseo-terminal-selected-"));
+        const sibling = mkdtempSync(join(tmpdir(), "paseo-terminal-sibling-"));
+        temporaryDirs.push(workspace, sibling);
+        const checkScript = join(workspace, "sandbox-check.sh");
+        writeFileSync(
+          checkScript,
+          [
+            "#!/bin/bash",
+            "printf selected > selected.txt",
+            `if printf sibling > '${sibling}/forbidden'; then echo 'RESULT:sibling=bad'; else echo 'RESULT:sibling=denied'; fi`,
+            "if printf state > /tmp/../var/tmp/paseo-forbidden; then echo 'RESULT:host=bad'; else echo 'RESULT:host=denied'; fi",
+            "if (echo >/dev/tcp/1.1.1.1/80) 2>/dev/null; then echo 'RESULT:network=bad'; else echo 'RESULT:network=denied'; fi",
+            "echo 'RESULT:done'",
+          ].join("\n"),
+        );
+        chmodSync(checkScript, 0o700);
+        const identity = statSync(workspace, { bigint: true });
+        const session = trackSession(
+          await createTerminal({
+            workspaceId: "ws-selected",
+            cwd: workspace,
+            env: { PS1: "$ " },
+            mayaRestrictedSandbox: {
+              workspaceRoot: workspace,
+              rootDevice: identity.dev,
+              rootInode: identity.ino,
+            },
+          }),
+        );
+
+        session.send({
+          type: "input",
+          data: "./sandbox-check.sh\r",
+        });
+        const state = await waitForState(session, (candidate) =>
+          getLines(candidate).some((line) => line.includes("RESULT:done")),
+        );
+        const output = [...state.scrollback, ...state.grid].map(rowToText).join("\n");
+        expect(output).toContain("RESULT:sibling=denied");
+        expect(output).toContain("RESULT:host=denied");
+        expect(output).toContain("RESULT:network=denied");
+        expect(output).not.toContain("RESULT:sibling=bad");
+        expect(output).not.toContain("RESULT:host=bad");
+        expect(output).not.toContain("RESULT:network=bad");
+        expect(readFileSync(join(workspace, "selected.txt"), "utf8")).toBe("selected");
+        expect(existsSync(join(sibling, "forbidden"))).toBe(false);
+      });
+    },
+  );
 
   describe("kill", () => {
     it("terminates the shell process", async () => {

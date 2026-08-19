@@ -51,14 +51,51 @@ function makeRecord(workspaceId: string): PersistedWorkspaceRecord {
   return { workspaceId } as unknown as PersistedWorkspaceRecord;
 }
 
+function fakeAuthority(
+  cwd: string,
+  workspaceId: string,
+  isCurrent: () => Promise<boolean> = async () => true,
+): MayaRestrictedWorkspaceAuthority {
+  const authority: MayaRestrictedWorkspaceAuthority = {
+    cwd,
+    workspaceId,
+    rootAccessPath: `/proc/self/fd/${workspaceId}`,
+    terminalSandboxBinding: async () => ({
+      workspaceRoot: cwd,
+      rootDevice: 1n,
+      rootInode: 2n,
+    }),
+    retain: () => authority,
+    release: async () => {},
+    isCurrent,
+  };
+  return authority;
+}
+
 function flushMicrotasks(): Promise<void> {
   return new Promise((done) => setImmediate(done));
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value?: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = (value) => done(value as T | PromiseLike<T>);
+  });
+  return { promise, resolve };
 }
 
 function buildHarness(
   opts: {
     emitCwdRejects?: boolean;
     restrictedAuthority?: MayaRestrictedWorkspaceAuthority;
+    openRestrictedAuthority?: (
+      cwd: string,
+      workspaceId: string,
+    ) => Promise<MayaRestrictedWorkspaceAuthority>;
+    emitCwd?: (cwd: string) => Promise<void>;
   } = {},
 ) {
   const listeners = new Map<string, WorkspaceGitListener>();
@@ -96,6 +133,9 @@ function buildHarness(
     },
     emitWorkspaceUpdateForCwd: async (cwd) => {
       emitCwdCalls.push(cwd);
+      if (opts.emitCwd) {
+        await opts.emitCwd(cwd);
+      }
       if (opts.emitCwdRejects) {
         throw new Error("emit boom");
       }
@@ -110,9 +150,10 @@ function buildHarness(
       branchChanges.push([workspaceId, oldBranch, newBranch]);
     },
     logger: { warn: (...args: unknown[]) => warnCalls.push(args) } as unknown as pino.Logger,
-    ...(opts.restrictedAuthority
+    ...(opts.restrictedAuthority || opts.openRestrictedAuthority
       ? {
-          openMayaRestrictedWorkspaceAuthority: async () => opts.restrictedAuthority!,
+          openMayaRestrictedWorkspaceAuthority:
+            opts.openRestrictedAuthority ?? (async () => opts.restrictedAuthority!),
         }
       : {}),
   });
@@ -192,6 +233,11 @@ describe("syncObservers", () => {
       cwd: WS1,
       workspaceId: "ws1",
       rootAccessPath: "/proc/self/fd/43",
+      terminalSandboxBinding: async () => ({
+        workspaceRoot: WS1,
+        rootDevice: 1n,
+        rootInode: 2n,
+      }),
       retain() {
         return this;
       },
@@ -205,6 +251,26 @@ describe("syncObservers", () => {
 
     expect(h.unsubscribeCalls).toEqual([WS1]);
     expect(h.registerCalls).toEqual([WS1, WS1]);
+  });
+
+  test("isolates a stale inactive workspace while keeping a healthy observer active", async () => {
+    const healthy = fakeAuthority(WS2, "healthy");
+    const h = buildHarness({
+      openRestrictedAuthority: async (_cwd, workspaceId) => {
+        if (workspaceId === "stale") throw new Error("catalog identity is stale");
+        return healthy;
+      },
+    });
+    await h.service.syncMayaRestrictedObservers([
+      makeDescriptor({ id: "stale", workspaceDirectory: WS1 }),
+      makeDescriptor({ id: "healthy", workspaceDirectory: WS2 }),
+    ]);
+
+    expect(h.registerCalls).toEqual([WS2]);
+    expect(h.warnCalls).toHaveLength(1);
+    h.emitSnapshot(WS2, "healthy-branch");
+    await flushMicrotasks();
+    expect(h.statusCalls).toEqual([{ cwd: WS2, branch: "healthy-branch" }]);
   });
 
   test("tears down the subscription when a git workspace becomes non-git", () => {
@@ -277,6 +343,11 @@ describe("git snapshot listener", () => {
       cwd: WS1,
       workspaceId: "ws1",
       rootAccessPath: "/proc/self/fd/41",
+      terminalSandboxBinding: async () => ({
+        workspaceRoot: WS1,
+        rootDevice: 1n,
+        rootInode: 2n,
+      }),
       retain() {
         return this;
       },
@@ -297,6 +368,31 @@ describe("git snapshot listener", () => {
     expect(h.branchChanges).toEqual([]);
     expect(h.emitCwdCalls).toEqual([]);
     expect(h.statusCalls).toEqual([]);
+  });
+
+  test("rechecks authority and subscription generation after an awaited workspace update", async () => {
+    const updateStarted = deferred<void>();
+    const releaseUpdate = deferred<void>();
+    let current = true;
+    const authority = fakeAuthority(WS1, "ws1", async () => current);
+    const h = buildHarness({
+      restrictedAuthority: authority,
+      emitCwd: async () => {
+        updateStarted.resolve();
+        await releaseUpdate.promise;
+      },
+    });
+    const descriptor = makeDescriptor({ id: "ws1", workspaceDirectory: WS1 });
+    await h.service.syncMayaRestrictedObservers([descriptor]);
+    h.emitSnapshot(WS1, "replacement");
+    await updateStarted.promise;
+    current = false;
+    h.service.removeForWorkspaceId("ws1");
+    releaseUpdate.resolve();
+    await flushMicrotasks();
+
+    expect(h.statusCalls).toEqual([]);
+    expect(h.branchChanges).toEqual([]);
   });
 
   test("fans a snapshot out to branch-change, workspace-update, and status-update", async () => {

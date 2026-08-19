@@ -27,7 +27,11 @@ import {
   type WSOutboundMessage,
   wrapSessionMessage,
 } from "./messages.js";
-import { asUint8Array, decodeBinaryFrame } from "@getpaseo/protocol/binary-frames/index";
+import {
+  asUint8Array,
+  classifyBinaryFrameKind,
+  decodeTerminalStreamFrame,
+} from "@getpaseo/protocol/binary-frames/index";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import type { HostnamesConfig } from "./hostnames.js";
 import { isHostnameAllowed } from "./hostnames.js";
@@ -2175,8 +2179,8 @@ export class VoiceAssistantWebSocketServer {
     if (!asBytes) {
       return false;
     }
-    const decodedFrame = decodeBinaryFrame(asBytes);
-    if (!decodedFrame) {
+    const frameKind = classifyBinaryFrameKind(asBytes);
+    if (!frameKind) {
       return false;
     }
     if (!activeConnection) {
@@ -2195,15 +2199,20 @@ export class VoiceAssistantWebSocketServer {
       ws.close(WS_CLOSE_INVALID_HELLO, "Binary frames are not supported on Hub sessions");
       return true;
     }
-    if (decodedFrame.kind === "terminal") {
+    if (frameKind === "terminal") {
+      const frame = decodeTerminalStreamFrame(asBytes);
+      if (!frame) {
+        log.warn("Rejected malformed terminal frame in Maya restricted mode");
+        return true;
+      }
       void activeConnection.session
-        .handleBinaryFrame(decodedFrame, true)
+        .handleBinaryFrame({ kind: "terminal", frame }, true)
         .catch((error: unknown) => {
           log.warn({ err: error }, "Rejected terminal frame without current Maya authority");
         });
       return true;
     }
-    log.warn({ frameKind: decodedFrame.kind }, "Rejected binary frame in Maya restricted mode");
+    log.warn({ frameKind }, "Rejected binary frame in Maya restricted mode");
     return true;
   }
 

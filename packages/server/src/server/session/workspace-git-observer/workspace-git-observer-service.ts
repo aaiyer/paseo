@@ -88,8 +88,13 @@ export function createWorkspaceGitObserverService(deps: {
   const workspaceStates = new Map<string, WorkspaceGitWatchState>();
   const subscriptions = new Map<
     string,
-    { unsubscribe: () => void; authority: MayaRestrictedWorkspaceAuthority | null }
+    {
+      unsubscribe: () => void;
+      authority: MayaRestrictedWorkspaceAuthority | null;
+      generation: number;
+    }
   >();
+  let nextSubscriptionGeneration = 1;
 
   function descriptorStateKey(workspace: WorkspaceDescriptorPayload | null): string {
     if (!workspace) {
@@ -224,7 +229,12 @@ export function createWorkspaceGitObserverService(deps: {
       if (authority) void authority.release();
       throw error;
     }
-    subscriptions.set(normalizedCwd, { unsubscribe: subscription.unsubscribe, authority });
+    subscriptions.set(normalizedCwd, {
+      unsubscribe: subscription.unsubscribe,
+      authority,
+      generation: nextSubscriptionGeneration,
+    });
+    nextSubscriptionGeneration += 1;
   }
 
   async function emitRestrictedSnapshot(
@@ -233,6 +243,7 @@ export function createWorkspaceGitObserverService(deps: {
     subscription: {
       unsubscribe: () => void;
       authority: MayaRestrictedWorkspaceAuthority | null;
+      generation: number;
     },
   ): Promise<void> {
     const authority = subscription.authority;
@@ -241,13 +252,21 @@ export function createWorkspaceGitObserverService(deps: {
       removeForCwd(cwd);
       return;
     }
-    handleBranchSnapshot(cwd, snapshot.git.currentBranch ?? null);
     try {
       await emitWorkspaceUpdateForCwd(cwd);
     } catch (error) {
       logger.warn({ err: error, cwd }, "Failed to emit workspace update after git branch snapshot");
     }
-    if (subscriptions.get(cwd) === subscription) emitStatusUpdate(cwd, snapshot);
+    if (
+      subscriptions.get(cwd) !== subscription ||
+      !(await authority.isCurrent()) ||
+      subscriptions.get(cwd)?.generation !== subscription.generation
+    ) {
+      removeForCwd(cwd);
+      return;
+    }
+    handleBranchSnapshot(cwd, snapshot.git.currentBranch ?? null);
+    emitStatusUpdate(cwd, snapshot);
   }
 
   function syncObservers(workspaces: Iterable<WorkspaceDescriptorPayload>): void {
@@ -264,34 +283,42 @@ export function createWorkspaceGitObserverService(deps: {
     workspaces: Iterable<WorkspaceDescriptorPayload>,
   ): Promise<void> {
     for (const workspace of workspaces) {
-      const isGit = workspace.workspaceKind !== "directory";
-      const cwd = resolve(workspace.workspaceDirectory);
-      if (!isGit) {
-        syncObserver(cwd, { isGit, workspaceId: workspace.id });
-        rememberDescriptorState(workspace.id, workspace);
-        continue;
-      }
-
-      const existingSubscription = subscriptions.get(cwd);
-      if (existingSubscription && !existingSubscription.authority) removeForCwd(cwd);
-      const existing = subscriptions.get(cwd)?.authority;
-      if (existing) {
-        if (existing.workspaceId !== workspace.id || !(await existing.isCurrent())) {
-          removeForCwd(cwd);
-          throw new Error("workspace observer authority no longer matches the catalog");
+      try {
+        const isGit = workspace.workspaceKind !== "directory";
+        const cwd = resolve(workspace.workspaceDirectory);
+        if (!isGit) {
+          syncObserver(cwd, { isGit, workspaceId: workspace.id });
+          rememberDescriptorState(workspace.id, workspace);
+          continue;
         }
-        syncObserver(cwd, { isGit, workspaceId: workspace.id });
-        rememberDescriptorState(workspace.id, workspace);
-        continue;
-      }
 
-      const authority = await openRestrictedAuthority(cwd);
-      if (authority.workspaceId !== workspace.id) {
-        await authority.release();
-        throw new Error("workspace observer authority does not match the catalog");
+        const existingSubscription = subscriptions.get(cwd);
+        if (existingSubscription && !existingSubscription.authority) removeForCwd(cwd);
+        const existing = subscriptions.get(cwd)?.authority;
+        if (existing) {
+          if (existing.workspaceId !== workspace.id || !(await existing.isCurrent())) {
+            removeForCwd(cwd);
+            throw new Error("workspace observer authority no longer matches the catalog");
+          }
+          syncObserver(cwd, { isGit, workspaceId: workspace.id });
+          rememberDescriptorState(workspace.id, workspace);
+          continue;
+        }
+
+        const authority = await openRestrictedAuthority(cwd);
+        if (authority.workspaceId !== workspace.id) {
+          await authority.release();
+          throw new Error("workspace observer authority does not match the catalog");
+        }
+        syncObserver(cwd, { isGit, workspaceId: workspace.id }, authority);
+        rememberDescriptorState(workspace.id, workspace);
+      } catch (error) {
+        removeForWorkspaceId(workspace.id);
+        logger.warn(
+          { err: error, cwd: workspace.workspaceDirectory, workspaceId: workspace.id },
+          "Skipped stale Maya restricted workspace observer",
+        );
       }
-      syncObserver(cwd, { isGit, workspaceId: workspace.id }, authority);
-      rememberDescriptorState(workspace.id, workspace);
     }
   }
 

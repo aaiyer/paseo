@@ -1,11 +1,15 @@
 // POSIX-only: symlink fixtures
 /* eslint-disable max-nested-callbacks */
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { getDownloadableFileInfo, listDirectoryEntries, readExplorerFile } from "./service.js";
 import { isPlatform } from "../../test-utils/platform.js";
+
+const execFileAsync = promisify(execFile);
 
 async function createTempDir(prefix: string): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), prefix));
@@ -74,6 +78,26 @@ describe.skipIf(isPlatform("win32"))("service POSIX-only", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects FIFOs before opening and repeated listings cannot starve", async () => {
+    const root = await createTempDir("paseo-file-explorer-fifo-");
+    try {
+      await writeFile(path.join(root, "visible.txt"), "visible\n", "utf-8");
+      await execFileAsync("/usr/bin/mkfifo", [path.join(root, "blocked.fifo")]);
+
+      const listings = await Promise.race([
+        Promise.all(Array.from({ length: 32 }, () => listDirectoryEntries({ root }))),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("FIFO listing blocked the event loop")), 1_000),
+        ),
+      ]);
+      for (const listing of listings) {
+        expect(listing.entries.map((entry) => entry.name)).toEqual(["visible.txt"]);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 

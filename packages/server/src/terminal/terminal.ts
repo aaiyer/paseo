@@ -128,6 +128,62 @@ export interface CreateTerminalOptions {
   title?: string;
   command?: string;
   args?: string[];
+  mayaRestrictedSandbox?: {
+    workspaceRoot: string;
+    rootDevice: bigint;
+    rootInode: bigint;
+  };
+}
+
+const MAYA_RESTRICTED_BWRAP = "/usr/bin/bwrap";
+const MAYA_RESTRICTED_SHELL = "/bin/bash";
+const MAYA_RESTRICTED_SHELL_VALIDATOR = `
+set -eu
+actual=$(/usr/bin/stat -Lc '%d:%i' -- "$1")
+[ "$actual" = "$2" ] || exit 125
+/bin/mkdir -m 0700 -- /tmp/home
+export HOME=/tmp/home TMPDIR=/tmp PATH=/usr/local/bin:/usr/bin:/bin
+exec /bin/bash --noprofile --norc
+`.trim();
+
+function resolveMayaRestrictedTerminalSpawn(input: {
+  cwd: string;
+  workspaceRoot: string;
+  rootDevice: bigint;
+  rootInode: bigint;
+}): { command: string; args: string[]; shell: string } {
+  if (input.cwd !== input.workspaceRoot || !input.cwd.startsWith("/")) {
+    throw new Error("restricted terminal cwd must be the selected workspace root");
+  }
+  return {
+    command: MAYA_RESTRICTED_BWRAP,
+    shell: MAYA_RESTRICTED_SHELL,
+    args: [
+      "--die-with-parent",
+      "--new-session",
+      "--unshare-all",
+      "--ro-bind",
+      "/",
+      "/",
+      "--proc",
+      "/proc",
+      "--dev",
+      "/dev",
+      "--tmpfs",
+      "/tmp",
+      "--bind",
+      input.workspaceRoot,
+      input.workspaceRoot,
+      "--chdir",
+      input.workspaceRoot,
+      MAYA_RESTRICTED_SHELL,
+      "-c",
+      MAYA_RESTRICTED_SHELL_VALIDATOR,
+      "maya-paseo-terminal-validator",
+      input.workspaceRoot,
+      `${input.rootDevice}:${input.rootInode}`,
+    ],
+  };
 }
 
 function toTerminalActivity(snapshot: {
@@ -895,6 +951,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     title: presetTitle,
     command,
     args = [],
+    mayaRestrictedSandbox,
   } = options;
   const resolvedShell = shell ?? resolveDefaultTerminalShell();
 
@@ -938,16 +995,24 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   ensureNodePtySpawnHelperExecutableForCurrentPlatform();
 
   // Create PTY
-  const { command: spawnCommand, args: spawnArgs } = command
-    ? await resolveTerminalSpawnCommand(command, args)
-    : { command: resolvedShell, args: [] as string[] };
+  if (mayaRestrictedSandbox && (command !== undefined || args.length !== 0)) {
+    throw new Error("restricted terminal command overrides are disabled");
+  }
+  const restrictedSpawn = mayaRestrictedSandbox
+    ? resolveMayaRestrictedTerminalSpawn({ cwd, ...mayaRestrictedSandbox })
+    : null;
+  const { command: spawnCommand, args: spawnArgs } = restrictedSpawn
+    ? restrictedSpawn
+    : command
+      ? await resolveTerminalSpawnCommand(command, args)
+      : { command: resolvedShell, args: [] as string[] };
   const ptyProcess = pty.spawn(spawnCommand, spawnArgs, {
     name: "xterm-256color",
     cols,
     rows,
     cwd,
     env: buildTerminalEnvironment({
-      shell: spawnCommand,
+      shell: restrictedSpawn?.shell ?? spawnCommand,
       env: {
         ...env,
         ...activityEnv,

@@ -5,6 +5,7 @@ import {
   filterMayaRestrictedCommandRegistration,
   isMayaRestrictedServerInfo,
   isMayaRestrictedShortcutActionAllowed,
+  resolveMayaRestrictedAppComposition,
   resolveMayaRestrictedRouteRedirect,
 } from "./policy";
 
@@ -99,13 +100,11 @@ describe("Maya restricted app policy", () => {
       "/h/maya/settings",
       "/h/maya/open-project",
       "/h/maya/plugin/github/pull-request",
-      "/settings",
-      "/new",
-      "/open-project",
-      "/schedules",
-      "/pair-scan",
     ]) {
       expect(resolveMayaRestrictedRouteRedirect({ pathname, restrictedServerIds })).toBe("/h/maya");
+    }
+    for (const pathname of ["/settings", "/new", "/open-project", "/schedules", "/pair-scan"]) {
+      expect(resolveMayaRestrictedRouteRedirect({ pathname, restrictedServerIds })).toBeNull();
     }
     expect(
       resolveMayaRestrictedRouteRedirect({ pathname: "/h/ordinary/settings", restrictedServerIds }),
@@ -158,5 +157,43 @@ describe("Maya restricted app policy", () => {
       "workspace:tab:new-agent",
       "workspace:tab:new-terminal",
     ]);
+  });
+
+  test("projects the complete AppContainer and CommandCenter composition from the routed server", () => {
+    expect(resolveMayaRestrictedAppComposition(false)).toEqual({
+      offerLinks: true,
+      openProjectEvents: true,
+      pluginCommands: true,
+      projectMutation: true,
+      providerSettings: true,
+      setupAndDiagnostics: true,
+      downloads: true,
+      selectedWorkspaceTerminal: true,
+      threadAndReadSurfaces: true,
+    });
+    expect(resolveMayaRestrictedAppComposition(true)).toEqual({
+      offerLinks: false,
+      openProjectEvents: false,
+      pluginCommands: false,
+      projectMutation: false,
+      providerSettings: false,
+      setupAndDiagnostics: false,
+      downloads: false,
+      selectedWorkspaceTerminal: true,
+      threadAndReadSurfaces: true,
+    });
+
+    expect(
+      resolveMayaRestrictedRouteRedirect({
+        pathname: "/h/ordinary/settings",
+        restrictedServerIds: ["maya"],
+      }),
+    ).toBeNull();
+    expect(
+      resolveMayaRestrictedRouteRedirect({
+        pathname: "/h/maya/settings",
+        restrictedServerIds: ["maya"],
+      }),
+    ).toBe("/h/maya");
   });
 });
