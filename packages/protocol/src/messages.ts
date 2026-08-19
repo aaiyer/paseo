@@ -3230,10 +3230,13 @@ const ServerCapabilitiesFromUnknownSchema = z
     return parsed.data;
   });
 
+export const MAYA_RESTRICTED_PROFILE = "maya-restricted" as const;
+
 export const ServerInfoStatusPayloadSchema = z
   .object({
     status: z.literal("server_info"),
     serverId: z.string().trim().min(1),
+    profile: z.literal(MAYA_RESTRICTED_PROFILE).optional(),
     hostname: ServerInfoHostnameSchema.optional(),
     version: ServerInfoVersionSchema.optional(),
     // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.

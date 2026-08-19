@@ -8,7 +8,7 @@ import { buildNewWorkspaceRoute } from "@/utils/host-routes";
 
 const WORKTREE_NEW_ACTIONS: readonly KeyboardActionId[] = ["worktree.new"];
 
-export function useActiveWorktreeNewAction() {
+export function useActiveWorktreeNewAction(enabled = true) {
   const selection = useActiveWorkspaceSelection();
   const serverId = selection?.serverId ?? null;
   const workspaceId = selection?.workspaceId ?? null;
@@ -32,7 +32,7 @@ export function useActiveWorktreeNewAction() {
   useKeyboardActionHandler({
     handlerId: "worktree-new-active",
     actions: WORKTREE_NEW_ACTIONS,
-    enabled: serverId !== null && activeGitWorkspace !== null,
+    enabled: enabled && serverId !== null && activeGitWorkspace !== null,
     priority: 0,
     handle,
   });

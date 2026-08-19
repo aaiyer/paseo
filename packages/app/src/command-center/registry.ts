@@ -41,7 +41,11 @@ function sameContributions(
   return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
-export function createCommandCenterRegistry(): CommandCenterRegistry {
+export function createCommandCenterRegistry(
+  transformRegistration: (registration: CommandCenterRegistration) => CommandCenterRegistration = (
+    registration,
+  ) => registration,
+): CommandCenterRegistry {
   const registrations = new Map<string, ActiveRegistration>();
   const listeners = new Set<() => void>();
   let snapshot = EMPTY_SNAPSHOT;
@@ -74,6 +78,7 @@ export function createCommandCenterRegistry(): CommandCenterRegistry {
       return () => listeners.delete(listener);
     },
     replace(registration) {
+      registration = transformRegistration(registration);
       const current = registrations.get(registration.owner.sourceId);
       if (
         current?.owner.token === registration.owner.token &&

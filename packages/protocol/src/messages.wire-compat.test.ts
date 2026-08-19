@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
+  MAYA_RESTRICTED_PROFILE,
   ServerInfoStatusPayloadSchema,
   WSHelloMessageSchema,
 } from "./messages.js";
@@ -92,6 +93,23 @@ describe("wire schema compatibility", () => {
       version: null,
       features: { agentTurnIdentity: true },
     });
+  });
+
+  test("server info carries only the exact internal Maya restricted profile marker", () => {
+    expect(
+      ServerInfoStatusPayloadSchema.parse({
+        status: "server_info",
+        serverId: "maya",
+        profile: MAYA_RESTRICTED_PROFILE,
+      }).profile,
+    ).toBe(MAYA_RESTRICTED_PROFILE);
+    expect(() =>
+      ServerInfoStatusPayloadSchema.parse({
+        status: "server_info",
+        serverId: "maya",
+        profile: "widened",
+      }),
+    ).toThrow();
   });
 
   test("assistant timeline message ids are optional on the wire", () => {

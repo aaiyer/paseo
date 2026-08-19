@@ -38,6 +38,7 @@ import {
   useActiveWorkspaceSelection,
 } from "@/stores/navigation-active-workspace-store";
 import { dispatchTopWebOverlayKeyDown } from "@/lib/overlay-root";
+import { isMayaRestrictedShortcutActionAllowed } from "@/maya-restricted/policy";
 
 export function useKeyboardShortcuts({
   enabled,
@@ -47,6 +48,7 @@ export function useKeyboardShortcuts({
   toggleBothSidebars,
   exitFocusMode,
   cycleTheme,
+  mayaRestricted,
 }: {
   enabled: boolean;
   isMobile: boolean;
@@ -55,6 +57,7 @@ export function useKeyboardShortcuts({
   toggleBothSidebars?: () => void;
   exitFocusMode: () => void;
   cycleTheme?: () => void;
+  mayaRestricted: boolean;
 }) {
   const keyboardActionDispatcher = useKeyboardActionDispatcher();
   const pathname = usePathname();
@@ -166,6 +169,9 @@ export function useKeyboardShortcuts({
       event: KeyboardEvent | null,
       browserFocusRestoreElement: HTMLElement | null = null,
     ): boolean => {
+      if (mayaRestricted && !isMayaRestrictedShortcutActionAllowed(action)) {
+        return false;
+      }
       switch (action.kind) {
         case "none":
           return false;
@@ -414,6 +420,7 @@ export function useKeyboardShortcuts({
     openProjectPickerAction,
     pathname,
     publishBrowserShortcutPolicy,
+    mayaRestricted,
     resetModifiers,
     router,
     shortcutsAvailable,

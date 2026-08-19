@@ -16,6 +16,7 @@ import type { CheckoutDiffManager, CheckoutDiffMetrics } from "./checkout-diff-m
 import type { DaemonConfigStore, MutableDaemonConfig } from "./daemon-config-store.js";
 import {
   type ServerInfoStatusPayload,
+  MAYA_RESTRICTED_PROFILE,
   type SessionOutboundMessage,
   type WorkspaceSetupSnapshot,
   type WSHelloMessage,
@@ -115,6 +116,63 @@ import {
 
 const WS_CLOSE_DAEMON_AUTH_FAILED = 4401;
 const MAYA_RESTRICTED_MAX_WEBSOCKET_PAYLOAD_BYTES = 512 * 1024;
+const MAYA_RESTRICTED_DENIED_FEATURES = {
+  checkoutForgeSetAutoMerge: false,
+  checkoutGithubSetAutoMerge: false,
+  githubCheckDetails: false,
+  forgeCheckDetails: false,
+  forgeSearch: false,
+  daemonStatusRpc: false,
+  daemonConfigReload: false,
+  relayConfig: false,
+  pushTokenRevocation: false,
+  plugins: false,
+  pluginManagement: false,
+  pluginLogs: false,
+  skillManagement: false,
+  rewind: false,
+  projectRemove: false,
+  projectAdd: false,
+  worktreeRestore: false,
+  workspaceRecovery: false,
+  workspaceFileEditing: false,
+  providerUsageList: false,
+  agentDetach: false,
+  agentThinkingUpdate: false,
+  daemonDiagnostics: false,
+  daemonSelfUpdate: false,
+  agentForkContext: false,
+  agentForkContextCursor: false,
+  providerSubagents: false,
+  workspacePinning: false,
+  hubRelationship: false,
+  projectGithubClone: false,
+  workspaceGithubRepositorySearch: false,
+  projectCreateDirectory: false,
+  providerRemoval: false,
+  importSessionWorkspaceTarget: false,
+  forgeProviders: false,
+  workspaceScriptManagement: false,
+  projectCustomIcon: false,
+  fsEntryOps: false,
+  fsEntryDuplicate: false,
+  checkoutDiscardChanges: false,
+  agentProfiles: false,
+  agentConfigApply: false,
+} as const;
+
+export function applyMayaRestrictedServerInfoProfile(
+  payload: ServerInfoStatusPayload,
+): ServerInfoStatusPayload {
+  return {
+    ...payload,
+    profile: MAYA_RESTRICTED_PROFILE,
+    features: {
+      ...payload.features,
+      ...MAYA_RESTRICTED_DENIED_FEATURES,
+    },
+  };
+}
 
 export interface ExternalSocketMetadata {
   transport: "relay";
@@ -1654,7 +1712,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private buildServerInfoStatusPayload(): ServerInfoStatusPayload {
-    return {
+    return applyMayaRestrictedServerInfoProfile({
       status: "server_info",
       serverId: this.serverId,
       hostname: getHostname(),
@@ -1778,7 +1836,7 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(agentConfigApply): added in v0.3.2, remove gate after 2027-02-11.
         agentConfigApply: true,
       },
-    };
+    });
   }
 
   private createServerInfoMessage(): WSOutboundMessage {
@@ -2137,6 +2195,14 @@ export class VoiceAssistantWebSocketServer {
       ws.close(WS_CLOSE_INVALID_HELLO, "Binary frames are not supported on Hub sessions");
       return true;
     }
+    if (decodedFrame.kind === "terminal") {
+      void activeConnection.session
+        .handleBinaryFrame(decodedFrame, true)
+        .catch((error: unknown) => {
+          log.warn({ err: error }, "Rejected terminal frame without current Maya authority");
+        });
+      return true;
+    }
     log.warn({ frameKind: decodedFrame.kind }, "Rejected binary frame in Maya restricted mode");
     return true;
   }
@@ -2191,18 +2257,17 @@ export class VoiceAssistantWebSocketServer {
       activeConnection?.connectionLogger ?? pendingConnection?.connectionLogger ?? this.logger;
 
     try {
-      if (isBinary) {
-        log.warn("Rejected binary WebSocket frame in Maya restricted mode");
-        return;
-      }
       const buffer = bufferFromWsData(data);
-      const binaryHandled = this.maybeHandleBinaryFrame({
-        ws,
-        buffer,
-        activeConnection,
-        log,
-      });
-      if (binaryHandled) {
+      if (isBinary) {
+        const binaryHandled = this.maybeHandleBinaryFrame({
+          ws,
+          buffer,
+          activeConnection,
+          log,
+        });
+        if (!binaryHandled) {
+          log.warn("Rejected malformed binary WebSocket frame in Maya restricted mode");
+        }
         return;
       }
 

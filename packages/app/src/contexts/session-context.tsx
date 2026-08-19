@@ -474,6 +474,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
     updateSessionServerInfo(serverId, {
       serverId: serverInfo.serverId,
+      ...(serverInfo.profile !== undefined ? { profile: serverInfo.profile } : {}),
       hostname: serverInfo.hostname,
       version: serverInfo.version,
       ...(serverInfo.desktopManaged !== undefined
@@ -828,6 +829,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
         );
         updateSessionServerInfo(serverId, {
           serverId: serverInfo.serverId,
+          ...(serverInfo.profile !== undefined ? { profile: serverInfo.profile } : {}),
           hostname: serverInfo.hostname,
           version: serverInfo.version,
           ...(serverInfo.desktopManaged !== undefined

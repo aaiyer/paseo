@@ -24,9 +24,6 @@ export const MAYA_RESTRICTED_ALLOWED_SESSION_MESSAGE_TYPES = [
   "list_provider_modes_request",
   "list_available_providers_request",
   "get_providers_snapshot_request",
-  "refresh_providers_snapshot_request",
-  "provider_diagnostic_request",
-  "provider.usage.list.request",
   "cancel_agent_request",
   "fetch_agent_timeline_request",
   "agent.timeline.list_prompts.request",
@@ -38,11 +35,20 @@ export const MAYA_RESTRICTED_ALLOWED_SESSION_MESSAGE_TYPES = [
   "checkout.commits.list.request",
   "checkout.commits.file_diff.request",
   "checkout.refresh.request",
-  "workspace_setup_status_request",
   "workspace.clear_attention.request",
   "file_explorer_request",
   "fs.file.subscribe.request",
   "fs.file.unsubscribe.request",
+  "list_terminals_request",
+  "subscribe_terminals_request",
+  "unsubscribe_terminals_request",
+  "create_terminal_request",
+  "terminal.rename.request",
+  "subscribe_terminal_request",
+  "unsubscribe_terminal_request",
+  "terminal_input",
+  "kill_terminal_request",
+  "capture_terminal_request",
   "clear_agent_attention",
   "client_heartbeat",
   "ping",
@@ -316,6 +322,29 @@ export function isMayaRestrictedWorkspaceReadRequest(
   }
 }
 
+function isMayaRestrictedWorkspaceSelectionRequest(
+  message: SessionInboundMessage,
+): message is Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | "list_terminals_request"
+      | "subscribe_terminals_request"
+      | "unsubscribe_terminals_request"
+      | "create_terminal_request";
+  }
+> {
+  switch (message.type) {
+    case "list_terminals_request":
+    case "subscribe_terminals_request":
+    case "unsubscribe_terminals_request":
+    case "create_terminal_request":
+      return true;
+    default:
+      return false;
+  }
+}
+
 /** Opens and binds the exact host-catalog identity used by downstream readers. */
 async function openFreshMayaRestrictedWorkspaceAuthority(
   cwd: string,
@@ -489,12 +518,20 @@ export async function acquireMayaRestrictedWorkspaceReadAuthority(
   message: SessionInboundMessage,
   workspaces: readonly RestrictedWorkspace[],
 ): Promise<MayaRestrictedWorkspaceAuthority | null> {
-  if (!isMayaRestrictedWorkspaceReadRequest(message)) return null;
+  if (
+    !isMayaRestrictedWorkspaceReadRequest(message) &&
+    !isMayaRestrictedWorkspaceSelectionRequest(message)
+  ) {
+    return null;
+  }
   const workspace = workspaces.find(
     (candidate) => candidate.archivedAt === null && candidate.cwd === message.cwd,
   );
   if (!workspace) throw new Error("cwd is not an active pre-registered workspace");
-  const authority = await openMayaRestrictedWorkspaceAuthority(message.cwd);
+  if (message.cwd !== workspace.cwd) {
+    throw new Error("cwd does not match the active pre-registered workspace");
+  }
+  const authority = await openMayaRestrictedWorkspaceAuthority(workspace.cwd);
   try {
     if (authority.workspaceId !== workspace.workspaceId) {
       throw new Error("workspace filesystem identity no longer matches the catalog");
@@ -506,8 +543,28 @@ export async function acquireMayaRestrictedWorkspaceReadAuthority(
   }
 }
 
-function hasOnlyCodexProviders(providers: readonly string[] | undefined): boolean {
-  return providers === undefined || providers.every((provider) => provider === "codex");
+export async function acquireMayaRestrictedWorkspaceSelectionAuthority(
+  cwd: string,
+  workspaceId: string,
+  workspaces: readonly RestrictedWorkspace[],
+): Promise<MayaRestrictedWorkspaceAuthority> {
+  const workspace = workspaces.find(
+    (candidate) =>
+      candidate.archivedAt === null &&
+      candidate.cwd === cwd &&
+      candidate.workspaceId === workspaceId,
+  );
+  if (!workspace) throw new Error("terminal workspace is not an active catalog selection");
+  const authority = await openMayaRestrictedWorkspaceAuthority(cwd);
+  try {
+    if (authority.workspaceId !== workspace.workspaceId) {
+      throw new Error("terminal workspace filesystem identity no longer matches the catalog");
+    }
+    return authority;
+  } catch (error) {
+    await authority.release();
+    throw error;
+  }
 }
 
 /**
@@ -531,11 +588,9 @@ export function evaluateMayaRestrictedSessionMessage(
     case "update_agent_request":
     case "wait_for_finish_request":
     case "list_available_providers_request":
-    case "provider.usage.list.request":
     case "fetch_agent_timeline_request":
     case "agent.timeline.list_prompts.request":
     case "agent.timeline.set_subscription.request":
-    case "workspace_setup_status_request":
     case "workspace.clear_attention.request":
     case "fs.file.unsubscribe.request":
     case "clear_agent_attention":
@@ -548,7 +603,9 @@ export function evaluateMayaRestrictedSessionMessage(
         : denied("cancellation requires the active nonempty turn id");
 
     case "close_items_request":
-      return message.terminalIds.length === 0 ? ALLOWED : denied("terminal lifecycle is disabled");
+      return message.terminalIds.length === 0
+        ? ALLOWED
+        : denied("terminal close requires the authority-bound terminal lifecycle request");
 
     case "agent_permission_response":
       if (message.response.behavior === "allow") {
@@ -614,14 +671,45 @@ export function evaluateMayaRestrictedSessionMessage(
     case "get_providers_snapshot_request":
       return message.cwd === undefined ? ALLOWED : evaluateRegisteredCwd(message.cwd, workspaces);
 
-    case "refresh_providers_snapshot_request":
-      if (!hasOnlyCodexProviders(message.providers)) {
-        return denied("only the Codex provider is enabled");
+    case "list_terminals_request":
+    case "subscribe_terminals_request":
+    case "unsubscribe_terminals_request": {
+      if (!message.cwd || !message.workspaceId) {
+        return denied("terminal directory access requires an exact workspace selection");
       }
-      return message.cwd === undefined ? ALLOWED : evaluateRegisteredCwd(message.cwd, workspaces);
+      const workspace = workspaces.find(
+        (candidate) =>
+          candidate.archivedAt === null &&
+          candidate.cwd === message.cwd &&
+          candidate.workspaceId === message.workspaceId,
+      );
+      return workspace ? ALLOWED : denied("terminal workspace selection is not registered");
+    }
 
-    case "provider_diagnostic_request":
-      return message.provider === "codex" ? ALLOWED : denied("only the Codex provider is enabled");
+    case "create_terminal_request": {
+      if (!message.workspaceId) {
+        return denied("terminal creation requires an exact workspace selection");
+      }
+      const workspace = workspaces.find(
+        (candidate) =>
+          candidate.archivedAt === null &&
+          candidate.cwd === message.cwd &&
+          candidate.workspaceId === message.workspaceId,
+      );
+      if (!workspace) return denied("terminal workspace selection is not registered");
+      if (message.agentId || message.command || message.args) {
+        return denied("terminal command and agent authority overrides are disabled");
+      }
+      return ALLOWED;
+    }
+
+    case "terminal.rename.request":
+    case "subscribe_terminal_request":
+    case "unsubscribe_terminal_request":
+    case "terminal_input":
+    case "kill_terminal_request":
+    case "capture_terminal_request":
+      return ALLOWED;
 
     case "checkout_status_request":
     case "subscribe_checkout_diff_request":
@@ -636,7 +724,9 @@ export function evaluateMayaRestrictedSessionMessage(
       return ALLOWED;
 
     case "client_heartbeat":
-      return message.focusedTerminalId === null ? ALLOWED : denied("terminal focus is disabled");
+      return message.focusedTerminalId === null || message.focusedTerminalId.trim().length > 0
+        ? ALLOWED
+        : denied("focused terminal id must be nonempty");
 
     case "list_commands_request":
       return message.draftConfig === undefined

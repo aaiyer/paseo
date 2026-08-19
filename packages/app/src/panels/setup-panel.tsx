@@ -15,6 +15,8 @@ import {
   type WorkspaceSetupSnapshot,
 } from "@/stores/workspace-setup-store";
 import { useHostRuntimeClient } from "@/runtime/host-runtime";
+import { useSessionStore } from "@/stores/session-store";
+import { isMayaRestrictedServerInfo } from "@/maya-restricted/policy";
 
 function useSetupPanelDescriptor(
   target: { kind: "setup"; workspaceId: string },
@@ -157,6 +159,9 @@ function SetupPanel() {
   invariant(target.kind === "setup", "SetupPanel requires setup target");
 
   const client = useHostRuntimeClient(serverId);
+  const mayaRestricted = useSessionStore((state) =>
+    isMayaRestrictedServerInfo(state.sessions[serverId]?.serverInfo),
+  );
   const key = buildWorkspaceTabPersistenceKey({
     serverId,
     workspaceId: target.workspaceId,
@@ -167,7 +172,7 @@ function SetupPanel() {
   // On mount, if no snapshot in the store, request cached status from server
   const requestedRef = useRef(false);
   useEffect(() => {
-    if (snapshot || requestedRef.current || !client) return;
+    if (mayaRestricted || snapshot || requestedRef.current || !client) return;
     requestedRef.current = true;
     client
       .fetchWorkspaceSetupStatus(target.workspaceId)
@@ -183,7 +188,7 @@ function SetupPanel() {
       .catch(() => {
         // Server may not support this yet — ignore
       });
-  }, [client, snapshot, serverId, target.workspaceId, upsertProgress]);
+  }, [client, mayaRestricted, snapshot, serverId, target.workspaceId, upsertProgress]);
 
   const commands = snapshot?.detail.commands ?? EMPTY_COMMANDS;
   const log = snapshot?.detail.log ?? "";

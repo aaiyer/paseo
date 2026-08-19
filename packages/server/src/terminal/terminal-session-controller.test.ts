@@ -13,6 +13,7 @@ import { TerminalSessionController } from "./terminal-session-controller.js";
 import type { TerminalManager, TerminalsChangedEvent } from "./terminal-manager.js";
 import { isSameOrDescendantPath } from "../server/path-utils.js";
 import { PluginSessionSocket } from "../server/plugins/session-socket.js";
+import type { MayaRestrictedWorkspaceAuthority } from "../server/maya-restricted-mode.js";
 
 function deferred<T>(): {
   promise: Promise<T>;
@@ -185,6 +186,89 @@ function listSession(input: {
 }
 
 describe("terminal-session-controller legacy terminal creation", () => {
+  test("retains exact workspace authority for terminal input and kills on identity drift", async () => {
+    const cwd = "/work/repo";
+    const workspaceId = "ws-bound";
+    const terminal = listSession({ id: "term-bound", name: "Shell", cwd, workspaceId });
+    const send = vi.spyOn(terminal, "send");
+    const killTerminal = vi.fn();
+    const terminalManager = {
+      getTerminals: vi.fn(),
+      createTerminal: vi.fn(async () => terminal),
+      registerCwdEnv: vi.fn(),
+      validateTerminalActivityToken: vi.fn(() => "unknown" as const),
+      getTerminal: vi.fn(() => terminal),
+      getTerminalState: vi.fn(),
+      setTerminalTitle: vi.fn(),
+      setTerminalActivity: vi.fn(),
+      clearTerminalAttention: vi.fn(),
+      killTerminal,
+      killTerminalAndWait: vi.fn(),
+      captureTerminal: vi.fn(),
+      listDirectories: vi.fn(() => []),
+      killAll: vi.fn(),
+      subscribeTerminalsChanged: vi.fn(() => vi.fn()),
+      subscribeTerminalActivity: vi.fn(() => vi.fn()),
+      subscribeTerminalWorkspaceContributionChanged: vi.fn(() => vi.fn()),
+    } satisfies TerminalManager;
+    let current = true;
+    let references = 1;
+    const authority: MayaRestrictedWorkspaceAuthority = {
+      cwd,
+      workspaceId,
+      rootAccessPath: "/proc/self/fd/7",
+      retain: () => {
+        references += 1;
+        return authority;
+      },
+      release: async () => {
+        references -= 1;
+      },
+      isCurrent: async () => current,
+    };
+    const controller = new TerminalSessionController({
+      terminalManager,
+      emit: vi.fn(),
+      emitBinary: vi.fn(),
+      hasBinaryChannel: () => true,
+      isPathWithinRoot: isSameOrDescendantPath,
+      sessionLogger: createLogger(),
+      listTerminalWorkspaceRefs: async () => [{ workspaceId, cwd }],
+      acquireMayaRestrictedWorkspaceAuthority: async () => authority.retain(),
+    });
+
+    await controller.dispatch(
+      { type: "create_terminal_request", cwd, workspaceId, requestId: "create" },
+      { mayaRestrictedMode: true, workspaceAuthority: authority },
+    );
+    expect(terminalManager.createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd, workspaceId }),
+    );
+    await controller.dispatch(
+      {
+        type: "terminal_input",
+        terminalId: terminal.id,
+        message: { type: "input", data: "pwd\r" },
+      },
+      { mayaRestrictedMode: true },
+    );
+    expect(send).toHaveBeenCalledWith({ type: "input", data: "pwd\r" });
+
+    current = false;
+    await controller.dispatch(
+      {
+        type: "terminal_input",
+        terminalId: terminal.id,
+        message: { type: "input", data: "id\r" },
+      },
+      { mayaRestrictedMode: true },
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(killTerminal).toHaveBeenCalledWith(terminal.id);
+    expect(references).toBe(1);
+    controller.dispose();
+  });
+
   test("resolves a missing workspaceId from the active workspace root", async () => {
     const rootCwd = "/work/repo";
     const appCwd = "/work/repo/packages/app";

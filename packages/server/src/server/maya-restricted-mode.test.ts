@@ -224,9 +224,6 @@ const PINNED_ALLOWED_TYPES = [
   "list_provider_modes_request",
   "list_available_providers_request",
   "get_providers_snapshot_request",
-  "refresh_providers_snapshot_request",
-  "provider_diagnostic_request",
-  "provider.usage.list.request",
   "cancel_agent_request",
   "fetch_agent_timeline_request",
   "agent.timeline.list_prompts.request",
@@ -238,11 +235,20 @@ const PINNED_ALLOWED_TYPES = [
   "checkout.commits.list.request",
   "checkout.commits.file_diff.request",
   "checkout.refresh.request",
-  "workspace_setup_status_request",
   "workspace.clear_attention.request",
   "file_explorer_request",
   "fs.file.subscribe.request",
   "fs.file.unsubscribe.request",
+  "list_terminals_request",
+  "subscribe_terminals_request",
+  "unsubscribe_terminals_request",
+  "create_terminal_request",
+  "terminal.rename.request",
+  "subscribe_terminal_request",
+  "unsubscribe_terminal_request",
+  "terminal_input",
+  "kill_terminal_request",
+  "capture_terminal_request",
   "clear_agent_attention",
   "client_heartbeat",
   "ping",
@@ -283,11 +289,6 @@ describe("Maya restricted mode", () => {
       type: "checkout_commit_request",
       cwd: "/srv/maya/worktree",
       requestId: "git",
-    },
-    {
-      type: "create_terminal_request",
-      cwd: "/srv/maya/worktree",
-      requestId: "terminal",
     },
     {
       type: "workspace.script.start.request",
@@ -376,7 +377,7 @@ describe("Maya restricted mode", () => {
     ).toMatchObject({ allowed: false });
   });
 
-  test("preserves native approvals but rejects terminal and provider widening", () => {
+  test("preserves native approvals but rejects unbound terminal close and provider widening", () => {
     expect(
       evaluate({
         type: "cancel_agent_request",
@@ -443,10 +444,39 @@ describe("Maya restricted mode", () => {
     expect(
       evaluate({
         type: "provider_diagnostic_request",
-        provider: "claude",
+        provider: "codex",
         requestId: "provider",
       }),
     ).toMatchObject({ allowed: false });
+  });
+
+  test("allows only the exact registered terminal selection without command authority", () => {
+    const base = {
+      type: "create_terminal_request",
+      cwd: "/srv/maya/worktree",
+      workspaceId: "registered",
+      requestId: "terminal",
+    };
+    expect(evaluate(base)).toEqual({ allowed: true, reason: "allowed" });
+    expect(evaluate({ ...base, cwd: "/srv/maya/other" })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, workspaceId: "archived" })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, workspaceId: undefined })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, command: "/bin/sh" })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, args: ["-c", "id"] })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, agentId: "agent" })).toMatchObject({ allowed: false });
+
+    for (const type of [
+      "list_terminals_request",
+      "subscribe_terminals_request",
+      "unsubscribe_terminals_request",
+    ] as const) {
+      expect(
+        evaluate({ type, cwd: base.cwd, workspaceId: base.workspaceId, requestId: "list" }),
+      ).toEqual({ allowed: true, reason: "allowed" });
+      expect(evaluate({ type, cwd: base.cwd, requestId: "unbound" })).toMatchObject({
+        allowed: false,
+      });
+    }
   });
 
   test("future message types hit the default deny", () => {

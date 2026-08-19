@@ -287,6 +287,7 @@ export interface AgentFileExplorerState {
 
 export interface DaemonServerInfo {
   serverId: string;
+  profile?: ServerInfoStatusPayload["profile"];
   hostname: string | null;
   version: string | null;
   desktopManaged?: boolean;
@@ -708,6 +709,7 @@ function isSessionServerInfoUnchanged(input: {
   nextDesktopManaged: boolean | undefined;
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
+  nextProfile: ServerInfoStatusPayload["profile"] | undefined;
   nextServerId: string;
 }): boolean {
   const {
@@ -717,11 +719,13 @@ function isSessionServerInfoUnchanged(input: {
     nextDesktopManaged,
     nextCapabilities,
     nextFeatures,
+    nextProfile,
   } = input;
   const prevHostname = currentServerInfo?.hostname?.trim() || null;
   const prevVersion = currentServerInfo?.version?.trim() || null;
   return (
     currentServerInfo?.serverId === input.nextServerId &&
+    currentServerInfo?.profile === nextProfile &&
     prevHostname === nextHostname &&
     prevVersion === nextVersion &&
     currentServerInfo?.desktopManaged === nextDesktopManaged &&
@@ -917,6 +921,7 @@ export const useSessionStore = create<SessionStore>()(
           const nextDesktopManaged = info.desktopManaged;
           const nextCapabilities = info.capabilities;
           const nextFeatures = info.features;
+          const nextProfile = info.profile;
 
           if (
             isSessionServerInfoUnchanged({
@@ -926,6 +931,7 @@ export const useSessionStore = create<SessionStore>()(
               nextDesktopManaged,
               nextCapabilities,
               nextFeatures,
+              nextProfile,
               nextServerId: info.serverId,
             })
           ) {
@@ -940,6 +946,7 @@ export const useSessionStore = create<SessionStore>()(
                 ...session,
                 serverInfo: {
                   serverId: info.serverId,
+                  ...(nextProfile !== undefined ? { profile: nextProfile } : {}),
                   hostname: nextHostname,
                   version: nextVersion,
                   ...(nextDesktopManaged !== undefined

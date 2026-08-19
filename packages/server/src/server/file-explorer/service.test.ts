@@ -16,6 +16,7 @@ import { runGitCommand } from "../../utils/run-git-command.js";
 import {
   DIRECTORY_ENTRY_OPEN_CONCURRENCY,
   installDirectoryEntryOpenHookForTest,
+  installDirectoryEntryEnumeratedHookForTest,
   listDirectoryEntries,
   MAX_DIRECTORY_ENTRIES,
   createExplorerEntry,
@@ -80,8 +81,12 @@ describe("file explorer service", () => {
 
   it("rejects an oversized directory before opening any entry handle", async () => {
     const root = await createTempDir("paseo-file-list-cap-");
+    let enumerated = 0;
     let opened = 0;
-    const uninstall = installDirectoryEntryOpenHookForTest((phase) => {
+    const uninstallEnumeration = installDirectoryEntryEnumeratedHookForTest(() => {
+      enumerated += 1;
+    });
+    const uninstallOpen = installDirectoryEntryOpenHookForTest((phase) => {
       if (phase === "opened") opened += 1;
     });
     try {
@@ -91,9 +96,11 @@ describe("file explorer service", () => {
       await expect(listDirectoryEntries({ root })).rejects.toThrow(
         `Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`,
       );
+      expect(enumerated).toBe(MAX_DIRECTORY_ENTRIES + 1);
       expect(opened).toBe(0);
     } finally {
-      uninstall();
+      uninstallOpen();
+      uninstallEnumeration();
       await rm(root, { recursive: true, force: true });
     }
   });

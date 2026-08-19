@@ -166,6 +166,8 @@ export interface MessageInputProps {
   attachmentSlot?: React.ReactNode;
   /** What this composer is for. See `@/composer/input-mode` for what each mode implies. */
   inputMode?: ComposerInputMode;
+  /** Internal Maya profile removes attachment and voice authority from chat presentation. */
+  mayaRestricted?: boolean;
   /** Renders `value` as static text on the same surface, for content there is nothing to type into. */
   readOnly?: boolean;
   /** Changes only when application state must replace native-owned text. */
@@ -1095,6 +1097,7 @@ interface ResolvedMessageInputProps {
   inputWrapperStyle: import("react-native").ViewStyle | undefined;
   attachmentSlot: React.ReactNode;
   inputMode: ComposerInputMode;
+  mayaRestricted: boolean;
   readOnly: boolean;
   textReplacementKey: string;
   submitLabel: string | undefined;
@@ -1142,6 +1145,7 @@ function resolveMessageInputProps(props: MessageInputProps): ResolvedMessageInpu
     inputWrapperStyle: props.inputWrapperStyle,
     attachmentSlot: props.attachmentSlot,
     inputMode: props.inputMode ?? "chat",
+    mayaRestricted: props.mayaRestricted === true,
     readOnly: props.readOnly ?? false,
     textReplacementKey: props.textReplacementKey,
     submitLabel: props.submitLabel,
@@ -1197,6 +1201,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       inputWrapperStyle,
       attachmentSlot,
       inputMode,
+      mayaRestricted,
       readOnly,
       textReplacementKey,
       submitLabel,
@@ -1857,7 +1862,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
             {/* Toolbar left: attachment button + agent controls */}
             <View style={styles.leftButtonGroup}>
               <AttachmentDropdown
-                visible={mode.showAttachments}
+                visible={mode.showAttachments && !mayaRestricted}
                 isConnected={isConnected}
                 disabled={disabled}
                 attachButtonStyle={attachButtonStyle}
@@ -1872,7 +1877,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
             <View style={styles.rightButtonGroup}>
               {beforeVoiceContent}
               <VoiceButtonTooltip
-                visible={mode.showVoice}
+                visible={mode.showVoice && !mayaRestricted}
                 onVoicePress={handleVoicePress}
                 isDictationStartEnabled={isDictationStartEnabled}
                 voiceButtonAccessibilityLabel={voiceButtonAccessibilityLabel}

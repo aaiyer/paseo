@@ -57,6 +57,7 @@ import { useKeyboardShortcutsStore } from "@/stores/keyboard-shortcuts-store";
 import { useHosts } from "@/runtime/host-runtime";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import { useWorkspace } from "@/stores/session-store-hooks";
+import { useSessionStore } from "@/stores/session-store";
 import { usePanelStore } from "@/stores/panel-store";
 import { useOwnsWindowChromeCorner, WindowChromeSafeArea } from "@/utils/desktop-window";
 import { useCloseAgentListGesture } from "@/mobile-panels/gestures";
@@ -69,6 +70,7 @@ import {
   buildSessionsRoute,
   buildSettingsAddHostRoute,
   buildSettingsRoute,
+  parseServerIdFromPathname,
 } from "@/utils/host-routes";
 import { openHostOverview } from "@/navigation/settings-navigation";
 import type { ShortcutKey } from "@/utils/format-shortcut";
@@ -76,12 +78,14 @@ import { SidebarAgentListSkeleton } from "./sidebar-agent-list-skeleton";
 import { SidebarCalloutSlot } from "./sidebar-callout-slot";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { PluginSidebarItems } from "@/plugins";
+import { isMayaRestrictedServerInfo } from "@/maya-restricted/policy";
 
 type SidebarTheme = ReturnType<typeof useUnistyles>["theme"];
 
 const DEV_BUILD_LABEL = process.env.EXPO_PUBLIC_PASEO_DEV_BUILD_LABEL?.trim() || null;
 
 interface SidebarSharedProps {
+  mayaRestricted: boolean;
   theme: SidebarTheme;
   statusGroups: StatusGroup[];
   pinnedGroups: PinnedSidebarGroups;
@@ -137,6 +141,15 @@ export const LeftSidebar = memo(function LeftSidebar({ active }: { active: boole
   const insets = useSafeAreaInsets();
   const isCompactLayout = useIsCompactFormFactor();
   const showMobileAgent = usePanelStore((state) => state.showMobileAgent);
+  const pathname = usePathname();
+  const routeServerId = parseServerIdFromPathname(pathname);
+  const mayaRestricted = useSessionStore((state) =>
+    routeServerId
+      ? isMayaRestrictedServerInfo(state.sessions[routeServerId]?.serverInfo)
+      : Object.values(state.sessions).some((session) =>
+          isMayaRestrictedServerInfo(session?.serverInfo),
+        ),
+  );
 
   const {
     projects,
@@ -241,6 +254,7 @@ export const LeftSidebar = memo(function LeftSidebar({ active }: { active: boole
   );
 
   const sharedProps = {
+    mayaRestricted,
     theme,
     statusGroups,
     pinnedGroups,
@@ -532,6 +546,7 @@ const SidebarNewWorkspaceHeaderRow = memo(function SidebarNewWorkspaceHeaderRow(
 });
 
 function SidebarFooter({
+  mayaRestricted,
   theme,
   handleOpenProject,
   handleHome,
@@ -540,6 +555,7 @@ function SidebarFooter({
   handleAddHost,
   handleOpenHostSettings,
 }: {
+  mayaRestricted: boolean;
   theme: SidebarTheme;
   handleOpenProject: () => void;
   handleHome: () => void;
@@ -556,6 +572,8 @@ function SidebarFooter({
 }) {
   const newAgentKeys = useShortcutKeys("new-agent");
   const settingsKeys = useShortcutKeys("toggle-settings");
+
+  if (mayaRestricted) return null;
 
   return (
     <View style={styles.sidebarFooter}>
@@ -594,6 +612,7 @@ function SidebarFooter({
 }
 
 function MobileSidebar({
+  mayaRestricted,
   theme,
   statusGroups,
   pinnedGroups,
@@ -659,13 +678,15 @@ function MobileSidebar({
       <View style={styles.sidebarContent} pointerEvents="auto">
         <WindowChromeSafeArea placement="below" />
         <View style={styles.sidebarHeaderGroup}>
-          <SidebarNewWorkspaceHeaderRow
-            label={labels.newWorkspace}
-            testID="sidebar-global-new-workspace"
-            variant="compact"
-            shortcutKeys={newWorkspaceKeys}
-            onBeforeNavigate={closeSidebar}
-          />
+          {!mayaRestricted ? (
+            <SidebarNewWorkspaceHeaderRow
+              label={labels.newWorkspace}
+              testID="sidebar-global-new-workspace"
+              variant="compact"
+              shortcutKeys={newWorkspaceKeys}
+              onBeforeNavigate={closeSidebar}
+            />
+          ) : null}
           <SidebarHeaderRow
             icon={History}
             label={labels.sessions}
@@ -674,15 +695,17 @@ function MobileSidebar({
             testID="sidebar-sessions"
             variant="compact"
           />
-          <SidebarHeaderRow
-            icon={CalendarClock}
-            label={labels.schedules}
-            onPress={handleViewSchedules}
-            isActive={isSchedulesActive}
-            testID="sidebar-schedules"
-            variant="compact"
-          />
-          <PluginSidebarItems onBeforeNavigate={closeSidebar} />
+          {!mayaRestricted ? (
+            <SidebarHeaderRow
+              icon={CalendarClock}
+              label={labels.schedules}
+              onPress={handleViewSchedules}
+              isActive={isSchedulesActive}
+              testID="sidebar-schedules"
+              variant="compact"
+            />
+          ) : null}
+          {!mayaRestricted ? <PluginSidebarItems onBeforeNavigate={closeSidebar} /> : null}
         </View>
         <WindowChromeSafeArea placement="inline" style={styles.mobileCloseButtonRow}>
           <Pressable
@@ -719,7 +742,7 @@ function MobileSidebar({
             isRefreshing={isManualRefresh && isRevalidating}
             onRefresh={handleRefresh}
             onWorkspacePress={handleWorkspacePress}
-            onAddProject={handleOpenProject}
+            onAddProject={mayaRestricted ? undefined : handleOpenProject}
             parentGestureRef={closeGestureRef}
             dragGestureHostPresented={dragGestureHostPresented}
             listHeaderComponent={workspacesSectionHeaderElement}
@@ -727,6 +750,7 @@ function MobileSidebar({
         )}
 
         <SidebarFooter
+          mayaRestricted={mayaRestricted}
           theme={theme}
           handleOpenProject={handleOpenProject}
           handleHome={handleHome}
@@ -741,6 +765,7 @@ function MobileSidebar({
 }
 
 function DesktopSidebar({
+  mayaRestricted,
   theme,
   statusGroups,
   pinnedGroups,
@@ -879,12 +904,14 @@ function DesktopSidebar({
             <TitlebarDragRegion />
           )}
           <View style={sidebarHeaderGroupStyle}>
-            <SidebarNewWorkspaceHeaderRow
-              label={labels.newWorkspace}
-              testID="sidebar-global-new-workspace"
-              variant="compact"
-              shortcutKeys={newWorkspaceKeys}
-            />
+            {!mayaRestricted ? (
+              <SidebarNewWorkspaceHeaderRow
+                label={labels.newWorkspace}
+                testID="sidebar-global-new-workspace"
+                variant="compact"
+                shortcutKeys={newWorkspaceKeys}
+              />
+            ) : null}
             <SidebarHeaderRow
               icon={History}
               label={labels.sessions}
@@ -893,15 +920,17 @@ function DesktopSidebar({
               testID="sidebar-sessions"
               variant="compact"
             />
-            <SidebarHeaderRow
-              icon={CalendarClock}
-              label={labels.schedules}
-              onPress={handleViewSchedules}
-              isActive={isSchedulesActive}
-              testID="sidebar-schedules"
-              variant="compact"
-            />
-            <PluginSidebarItems />
+            {!mayaRestricted ? (
+              <SidebarHeaderRow
+                icon={CalendarClock}
+                label={labels.schedules}
+                onPress={handleViewSchedules}
+                isActive={isSchedulesActive}
+                testID="sidebar-schedules"
+                variant="compact"
+              />
+            ) : null}
+            {!mayaRestricted ? <PluginSidebarItems /> : null}
           </View>
         </View>
 
@@ -919,14 +948,15 @@ function DesktopSidebar({
             workspaceEntriesByKey={workspaceEntriesByKey}
             isRefreshing={isManualRefresh && isRevalidating}
             onRefresh={handleRefresh}
-            onAddProject={handleOpenProject}
+            onAddProject={mayaRestricted ? undefined : handleOpenProject}
             listHeaderComponent={workspacesSectionHeaderElement}
           />
         )}
 
-        <SidebarCalloutSlot />
+        {!mayaRestricted ? <SidebarCalloutSlot /> : null}
 
         <SidebarFooter
+          mayaRestricted={mayaRestricted}
           theme={theme}
           handleOpenProject={handleOpenProject}
           handleHome={handleHome}

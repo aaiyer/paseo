@@ -101,9 +101,13 @@ export class WorkspaceFilesSession {
         { cwd: authority?.rootAccessPath ?? request.cwd, path: request.path },
         (version) => {
           void (async () => {
+            const generationIsCurrent =
+              this.fileSubscriptions.get(request.subscriptionId) === unsubscribe;
+            const authorityIsCurrent = !retainedAuthority || (await retainedAuthority.isCurrent());
             if (
-              this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe ||
-              (retainedAuthority && !(await retainedAuthority.isCurrent()))
+              !generationIsCurrent ||
+              !authorityIsCurrent ||
+              this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe
             ) {
               unsubscribe();
               if (this.fileSubscriptions.get(request.subscriptionId) === unsubscribe) {

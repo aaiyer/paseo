@@ -44,6 +44,7 @@ import {
 import { ContextWindowMeter } from "@/components/context-window-meter";
 import { useImageAttachmentPicker } from "@/hooks/use-image-attachment-picker";
 import { selectAgentTurnPresentation, useSessionStore } from "@/stores/session-store";
+import { isMayaRestrictedServerInfo } from "@/maya-restricted/policy";
 import { useFilePicker } from "@/hooks/use-file-picker";
 import { useFileDrop } from "@/components/file-drop/use-file-drop";
 import type { DroppedItem } from "@/components/file-drop/types";
@@ -1179,6 +1180,9 @@ function ComposerContentImpl({
   placeholder,
 }: ComposerContentProps) {
   const mode = resolveComposerInputMode(inputMode);
+  const mayaRestricted = useSessionStore((state) =>
+    isMayaRestrictedServerInfo(state.sessions[serverId]?.serverInfo),
+  );
   const { t } = useTranslation();
   const buttonIconSize = resolveComposerButtonIconSize();
   const client = useHostRuntimeClient(serverId);
@@ -2096,9 +2100,17 @@ function ComposerContentImpl({
         serverId,
         focusInput,
         isCompactLayout,
-        showAgentControls: mode.showAgentControls,
+        showAgentControls: mode.showAgentControls && !mayaRestricted,
       }),
-    [agentControls, agentId, focusInput, isCompactLayout, mode.showAgentControls, serverId],
+    [
+      agentControls,
+      agentId,
+      focusInput,
+      isCompactLayout,
+      mayaRestricted,
+      mode.showAgentControls,
+      serverId,
+    ],
   );
 
   const handleAttachButtonRef = useCallback((node: View | null) => {
@@ -2236,7 +2248,7 @@ function ComposerContentImpl({
   const githubEmptyText = githubSearchResultsQuery.isFetching
     ? t("composer.github.searching")
     : t("composer.github.noResults");
-  const autocompleteVisible = autocomplete.isVisible && mode.showAutocomplete;
+  const autocompleteVisible = autocomplete.isVisible && mode.showAutocomplete && !mayaRestricted;
 
   return (
     <>
@@ -2288,10 +2300,10 @@ function ComposerContentImpl({
                   preserveHeightOnSubmit={submitBehavior === "preserve-and-lock"}
                   attachments={selectedAttachments}
                   cwd={cwd}
-                  attachmentMenuItems={attachmentMenuItems}
+                  attachmentMenuItems={mayaRestricted ? [] : attachmentMenuItems}
                   onAttachButtonRef={handleAttachButtonRef}
-                  onAddImages={addImages}
-                  onPasteImages={handleNativePasteImages}
+                  onAddImages={mayaRestricted ? undefined : addImages}
+                  onPasteImages={mayaRestricted ? undefined : handleNativePasteImages}
                   client={client}
                   isReadyForDictation={isDictationReady}
                   placeholder={messagePlaceholder}
@@ -2315,6 +2327,7 @@ function ComposerContentImpl({
                   inputWrapperStyle={inputWrapperStyle}
                   attachmentSlot={attachmentTray}
                   inputMode={inputMode}
+                  mayaRestricted={mayaRestricted}
                   readOnly={readOnly}
                   textReplacementKey={textReplacementKey}
                   submitLabel={submitLabel}

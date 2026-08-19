@@ -105,7 +105,10 @@ vi.mock("./push/index.js", () => ({
 }));
 
 import { z } from "zod";
-import { VoiceAssistantWebSocketServer } from "./websocket-server";
+import {
+  applyMayaRestrictedServerInfoProfile,
+  VoiceAssistantWebSocketServer,
+} from "./websocket-server";
 import { parseServerInfoStatusPayload } from "./messages.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
 
@@ -744,7 +747,7 @@ describe("relay external socket reconnect behavior", () => {
     await server.close();
   });
 
-  test("responds to top-level ping while provider diagnostic is still running", async () => {
+  test("responds to top-level ping while the provider snapshot is still running", async () => {
     const server = createServer();
     const socket = new MockSocket();
     await attachRelayAndHello({
@@ -754,7 +757,7 @@ describe("relay external socket reconnect behavior", () => {
     });
 
     const session = sessionMock.instances[0];
-    const providerDiagnostic = holdNextSessionMessage(session);
+    const providerSnapshot = holdNextSessionMessage(session);
 
     const sentBeforeDiagnostic = socket.sent.length;
     socket.emit(
@@ -762,9 +765,8 @@ describe("relay external socket reconnect behavior", () => {
       JSON.stringify({
         type: "session",
         message: {
-          type: "provider_diagnostic_request",
-          provider: "codex",
-          requestId: "slow-provider-diagnostic",
+          type: "get_providers_snapshot_request",
+          requestId: "slow-provider-snapshot",
         },
       }),
     );
@@ -777,12 +779,12 @@ describe("relay external socket reconnect behavior", () => {
 
     expect(sentEnvelopes(socket).slice(sentBeforeDiagnostic)).toContainEqual({ type: "pong" });
 
-    providerDiagnostic.finish();
+    providerSnapshot.finish();
     await Promise.resolve();
     await server.close();
   });
 
-  test("routes later session requests while provider diagnostic is still running", async () => {
+  test("routes later session requests while the provider snapshot is still running", async () => {
     const server = createServer();
     const socket = new MockSocket();
     await attachRelayAndHello({
@@ -792,16 +794,15 @@ describe("relay external socket reconnect behavior", () => {
     });
 
     const session = sessionMock.instances[0];
-    const providerDiagnostic = holdNextSessionMessage(session);
+    const providerSnapshot = holdNextSessionMessage(session);
 
     socket.emit(
       "message",
       JSON.stringify({
         type: "session",
         message: {
-          type: "provider_diagnostic_request",
-          provider: "codex",
-          requestId: "slow-provider-diagnostic",
+          type: "get_providers_snapshot_request",
+          requestId: "slow-provider-snapshot",
         },
       }),
     );
@@ -824,7 +825,7 @@ describe("relay external socket reconnect behavior", () => {
       expect(session.handleMessage).toHaveBeenCalledTimes(2);
     });
 
-    providerDiagnostic.finish();
+    providerSnapshot.finish();
     await Promise.resolve();
     await server.close();
   });
@@ -847,9 +848,8 @@ describe("relay external socket reconnect behavior", () => {
       JSON.stringify({
         type: "session",
         message: {
-          type: "provider_diagnostic_request",
-          provider: "codex",
-          requestId: "failing-provider-diagnostic",
+          type: "get_providers_snapshot_request",
+          requestId: "failing-provider-snapshot",
         },
       }),
     );
@@ -860,8 +860,8 @@ describe("relay external socket reconnect behavior", () => {
         message: {
           type: "rpc_error",
           payload: {
-            requestId: "failing-provider-diagnostic",
-            requestType: "provider_diagnostic_request",
+            requestId: "failing-provider-snapshot",
+            requestType: "get_providers_snapshot_request",
             error: "Invalid message",
             code: "invalid_message",
           },
@@ -977,14 +977,56 @@ describe("relay external socket reconnect behavior", () => {
       clientId: "cid-stable-project-identity",
     });
 
+    expect(serverInfo.profile).toBe("maya-restricted");
     expect(serverInfo.features?.stableProjectIdentity).toBe(true);
     expect(serverInfo.features?.canonicalSubmittedPrompts).toBe(true);
     expect(serverInfo.features?.providersSnapshotCwd).toBe(true);
-    expect(serverInfo.features?.pluginLogs).toBe(true);
+    expect(serverInfo.features?.pluginLogs).toBe(false);
+    expect(serverInfo.features?.forgeSearch).toBe(false);
+    expect(serverInfo.features?.projectGithubClone).toBe(false);
+    expect(serverInfo.features?.workspaceGithubRepositorySearch).toBe(false);
+    expect(serverInfo.features?.workspaceFileEditing).toBe(false);
+    expect(serverInfo.features?.checkoutDiscardChanges).toBe(false);
+    expect(serverInfo.features?.providerSubagents).toBe(false);
+    expect(serverInfo.features?.agentProfiles).toBe(false);
     expect(serverInfo.features?.["terminal-input-mode-replay"]).toBe(true);
     expect(serverInfo.features?.["terminal-size-ownership"]).toBe(true);
     expect(serverInfo.features?.agentTurnIdentity).toBeUndefined();
     await server.close();
+  });
+
+  test("applies one restricted overlay without mutating the ordinary upstream projection", () => {
+    const ordinary = {
+      status: "server_info" as const,
+      serverId: "ordinary",
+      features: {
+        daemonStatusRpc: true,
+        relayConfig: true,
+        plugins: true,
+        forgeSearch: true,
+        "terminal-input-mode-replay": true,
+      },
+    };
+    const restricted = applyMayaRestrictedServerInfoProfile(ordinary);
+    expect(ordinary).toEqual({
+      status: "server_info",
+      serverId: "ordinary",
+      features: {
+        daemonStatusRpc: true,
+        relayConfig: true,
+        plugins: true,
+        forgeSearch: true,
+        "terminal-input-mode-replay": true,
+      },
+    });
+    expect(restricted.profile).toBe("maya-restricted");
+    expect(restricted.features).toMatchObject({
+      daemonStatusRpc: false,
+      relayConfig: false,
+      plugins: false,
+      forgeSearch: false,
+      "terminal-input-mode-replay": true,
+    });
   });
 
   test("includes voice capabilities in initial server_info when speech readiness exists", async () => {
@@ -1068,7 +1110,7 @@ describe("relay external socket reconnect behavior", () => {
     await server.close();
   });
 
-  test("rejects inbound terminal frames before session dispatch", async () => {
+  test("dispatches decoded terminal frames through the restricted terminal authority path", async () => {
     const server = createServer();
 
     const socket = new MockSocket();
@@ -1089,13 +1131,18 @@ describe("relay external socket reconnect behavior", () => {
           payload: new TextEncoder().encode("ls\r"),
         }),
       ),
+      true,
     );
-    expect(session.handleBinaryFrame).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(session.handleBinaryFrame).toHaveBeenCalledTimes(1));
+    expect(session.handleBinaryFrame).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "terminal" }),
+      true,
+    );
 
     await server.close();
   });
 
-  test("does not surface session binary errors because binary ingress is denied", async () => {
+  test("does not surface authority-bound terminal binary handler errors", async () => {
     const server = createServer();
 
     const socket = new MockSocket();
@@ -1118,10 +1165,11 @@ describe("relay external socket reconnect behavior", () => {
           payload: new TextEncoder().encode("pwd\r"),
         }),
       ),
+      true,
     );
 
     await Promise.resolve();
-    expect(session.handleBinaryFrame).not.toHaveBeenCalled();
+    expect(session.handleBinaryFrame).toHaveBeenCalledTimes(1);
     expect(sentEnvelopes(socket).slice(sentBeforeFrame)).toEqual([]);
 
     await server.close();

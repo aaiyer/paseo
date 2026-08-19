@@ -25,7 +25,10 @@ import {
 import { DownloadTokenStore } from "../../file-download/token-store.js";
 import type { SessionOutboundMessage } from "../../messages.js";
 import type { FileObserver } from "../../file-explorer/observer.js";
-import { openMayaRestrictedWorkspaceAuthority } from "../../maya-restricted-mode.js";
+import {
+  openMayaRestrictedWorkspaceAuthority,
+  type MayaRestrictedWorkspaceAuthority,
+} from "../../maya-restricted-mode.js";
 
 const tempDirs: string[] = [];
 
@@ -135,6 +138,72 @@ describe("WorkspaceFilesSession", () => {
     ]);
     subsystem.dispose();
     expect(secondUnsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  test("suppresses an old update when its subscription generation changes during authority validation", async () => {
+    type ObserverListener = Parameters<FileObserver["subscribe"]>[1];
+    const listeners: ObserverListener[] = [];
+    const unsubscribes = [vi.fn(), vi.fn()];
+    const fileObserver = {
+      subscribe: vi.fn(async (input: { cwd: string; path: string }, next: ObserverListener) => {
+        const index = listeners.push(next) - 1;
+        return {
+          initial: { status: "missing" as const, cwd: input.cwd, path: input.path },
+          unsubscribe: unsubscribes[index],
+        };
+      }),
+    } as unknown as FileObserver;
+    let validationStarted: (() => void) | undefined;
+    const atValidation = new Promise<void>((resolve) => {
+      validationStarted = resolve;
+    });
+    let finishValidation: (() => void) | undefined;
+    const validation = new Promise<boolean>((resolve) => {
+      finishValidation = () => resolve(true);
+    });
+    const authority = {
+      rootAccessPath: makeDir("workspace-files-generation-authority-"),
+      retain: () => authority,
+      release: vi.fn(async () => undefined),
+      isCurrent: vi
+        .fn()
+        .mockResolvedValueOnce(true)
+        .mockImplementationOnce(() => {
+          validationStarted?.();
+          return validation;
+        }),
+    } as unknown as MayaRestrictedWorkspaceAuthority;
+    const { subsystem, emitted } = makeSubsystem({ fileObserver });
+    const request = {
+      type: "fs.file.subscribe.request" as const,
+      cwd: authority.rootAccessPath,
+      path: "notes.txt",
+      subscriptionId: "generation-race",
+    };
+
+    await subsystem.handleFileSubscribeRequest({ ...request, requestId: "old" }, authority);
+    listeners[0]?.({
+      status: "ready",
+      cwd: authority.rootAccessPath,
+      path: "notes.txt",
+      size: 3,
+      modifiedAt: "2026-08-19T00:00:00.000Z",
+      revision: "1:2:3:4",
+    });
+    await atValidation;
+    await subsystem.handleFileSubscribeRequest({ ...request, requestId: "new" });
+    finishValidation?.();
+
+    await vi.waitFor(() => expect(unsubscribes[0]).toHaveBeenCalledTimes(1));
+    expect(emitted.filter((message) => message.type === "fs.file.update")).toEqual([]);
+    expect(emitted.at(-1)).toEqual(
+      expect.objectContaining({
+        type: "fs.file.subscribe.response",
+        payload: expect.objectContaining({ requestId: "new" }),
+      }),
+    );
+    subsystem.dispose();
+    expect(unsubscribes[1]).toHaveBeenCalledTimes(1);
   });
 
   test("creates an entry and emits the complete success response", async () => {

@@ -83,6 +83,7 @@ import {
 } from "@/runtime/host-runtime";
 import { prefetchProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import { shouldShowWorkspaceSetup, useWorkspaceSetupStore } from "@/stores/workspace-setup-store";
+import { isMayaRestrictedServerInfo } from "@/maya-restricted/policy";
 import { useWorkspace } from "@/stores/session-store-hooks";
 import { useWorkspaceTerminalSessionRetention } from "@/terminal/hooks/use-workspace-terminal-session-retention";
 import type { CheckoutStatusPayload } from "@/git/use-status-query";
@@ -1766,7 +1767,10 @@ function WorkspaceScreenContent({
     persistenceKey ? (state.snapshots[persistenceKey] ?? null) : null,
   );
   const ensureWorkspaceSetupStatus = useWorkspaceSetupStore((state) => state.ensureSetupStatus);
-  const showWorkspaceSetup = shouldShowWorkspaceSetup(workspaceSetupSnapshot);
+  const mayaRestricted = useSessionStore((state) =>
+    isMayaRestrictedServerInfo(state.sessions[normalizedServerId]?.serverInfo),
+  );
+  const showWorkspaceSetup = !mayaRestricted && shouldShowWorkspaceSetup(workspaceSetupSnapshot);
   const uiTabs = useMemo(
     () => (workspaceLayout ? collectAllTabs(workspaceLayout.root) : EMPTY_UI_TABS),
     [workspaceLayout],
@@ -2021,7 +2025,13 @@ function WorkspaceScreenContent({
   const autoOpenedSetupTabWorkspaceRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!isRouteFocused || !client || !normalizedServerId || !normalizedWorkspaceId) {
+    if (
+      mayaRestricted ||
+      !isRouteFocused ||
+      !client ||
+      !normalizedServerId ||
+      !normalizedWorkspaceId
+    ) {
       return;
     }
     ensureWorkspaceSetupStatus({
@@ -2033,6 +2043,7 @@ function WorkspaceScreenContent({
     client,
     ensureWorkspaceSetupStatus,
     isRouteFocused,
+    mayaRestricted,
     normalizedServerId,
     normalizedWorkspaceId,
   ]);

@@ -1,4 +1,4 @@
-import { constants, promises as fs, type BigIntStats } from "fs";
+import { constants, promises as fs, type BigIntStats, type Dirent } from "fs";
 import type { FileHandle } from "fs/promises";
 import path from "path";
 import { randomUUID } from "crypto";
@@ -108,6 +108,7 @@ const ACCESS_OUTSIDE_WORKSPACE_MESSAGE = "Access outside of workspace is not all
 let beforeScopedReadOpenForTest: (() => Promise<void>) | null = null;
 let directoryEntryOpenHookForTest: ((phase: "opened" | "closed") => Promise<void> | void) | null =
   null;
+let directoryEntryEnumeratedHookForTest: (() => void) | null = null;
 
 /** Deterministic race seam for production read-path regression tests only. */
 export function installFileExplorerBeforeReadOpenHookForTest(
@@ -136,6 +137,20 @@ export function installDirectoryEntryOpenHookForTest(
   directoryEntryOpenHookForTest = hook;
   return () => {
     if (directoryEntryOpenHookForTest === hook) directoryEntryOpenHookForTest = null;
+  };
+}
+
+/** Deterministic directory-iteration seam for bounded-enumeration regression tests only. */
+export function installDirectoryEntryEnumeratedHookForTest(hook: () => void): () => void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("directory entry enumeration hook is test-only");
+  }
+  if (directoryEntryEnumeratedHookForTest) {
+    throw new Error("directory entry enumeration hook is already installed");
+  }
+  directoryEntryEnumeratedHookForTest = hook;
+  return () => {
+    if (directoryEntryEnumeratedHookForTest === hook) directoryEntryEnumeratedHookForTest = null;
   };
 }
 
@@ -196,9 +211,20 @@ export async function listDirectoryEntries({
     }
 
     const descriptorPath = descriptorPathFor(opened.handle);
-    const dirents = await fs.readdir(descriptorPath, { withFileTypes: true });
-    if (dirents.length > MAX_DIRECTORY_ENTRIES) {
-      throw new Error(`Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`);
+    const directory = await fs.opendir(descriptorPath);
+    const dirents: Dirent[] = [];
+    try {
+      for (;;) {
+        const dirent = await directory.read();
+        if (!dirent) break;
+        directoryEntryEnumeratedHookForTest?.();
+        dirents.push(dirent);
+        if (dirents.length > MAX_DIRECTORY_ENTRIES) {
+          throw new Error(`Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`);
+        }
+      }
+    } finally {
+      await directory.close();
     }
 
     const entriesWithNulls = await mapWithConcurrency(

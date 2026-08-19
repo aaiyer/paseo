@@ -49,6 +49,7 @@ import type {
   ExplorerEntry,
 } from "@/stores/session-store";
 import { useSessionStore } from "@/stores/session-store";
+import { isMayaRestrictedServerInfo } from "@/maya-restricted/policy";
 import { FileActionsContextMenuContent } from "@/components/file-actions-menu";
 import { ContextMenu, ContextMenuTrigger, useContextMenu } from "@/components/ui/context-menu";
 import { useFileDownload } from "@/hooks/use-file-download";
@@ -119,7 +120,7 @@ interface TreeRowItemProps {
   onCopyRelativePath: (path: string) => void;
   onRevealEntry?: (entry: ExplorerEntry) => void;
   revealTargetName?: string;
-  onDownloadEntry: (entry: ExplorerEntry) => void;
+  onDownloadEntry?: (entry: ExplorerEntry) => void;
   onAddToChat?: (path: string) => void;
   onNewEntry?: (parentPath: string, kind: "file" | "directory") => void;
   onCollapseDirectory?: (path: string) => void;
@@ -302,7 +303,7 @@ function TreeRowItem({
   }, [onRevealEntry, entry]);
 
   const handleDownload = useCallback(() => {
-    onDownloadEntry(entry);
+    onDownloadEntry?.(entry);
   }, [onDownloadEntry, entry]);
 
   const handleAddToChat = useCallback(() => {
@@ -397,7 +398,7 @@ function TreeRowItem({
         onCopyRelativePath={handleCopyRelativePath}
         onReveal={onRevealEntry ? handleReveal : undefined}
         revealTargetName={revealTargetName}
-        onDownload={handleDownload}
+        onDownload={onDownloadEntry ? handleDownload : undefined}
         onAddToChat={onAddToChat ? handleAddToChat : undefined}
         onNewFile={onNewEntry ? handleNewFile : undefined}
         onNewFolder={onNewEntry ? handleNewFolder : undefined}
@@ -444,6 +445,9 @@ export function FileExplorerPane({
     workspaceStateKey && state.sessions[serverId]
       ? state.sessions[serverId]?.fileExplorer.get(workspaceStateKey)
       : undefined,
+  );
+  const mayaRestricted = useSessionStore((state) =>
+    isMayaRestrictedServerInfo(state.sessions[serverId]?.serverInfo),
   );
 
   const {
@@ -986,7 +990,7 @@ export function FileExplorerPane({
           onCopyRelativePath={handleCopyRelativePath}
           onRevealEntry={fileManagerTarget ? handleRevealEntry : undefined}
           revealTargetName={fileManagerTarget?.label}
-          onDownloadEntry={handleDownloadEntry}
+          onDownloadEntry={mayaRestricted ? undefined : handleDownloadEntry}
           onAddToChat={onAddToChat}
           onNewEntry={fsEntryOpsEnabled ? handleNewEntry : undefined}
           onCollapseDirectory={handleCollapseDirectory}
@@ -1015,6 +1019,7 @@ export function FileExplorerPane({
       handleRevealEntry,
       handleSelectEntry,
       isDirectoryLoading,
+      mayaRestricted,
       fileManagerTarget,
       selectedEntryPath,
       onAddToChat,
@@ -1464,7 +1469,7 @@ function TreeRowDispatcher({
   onCopyRelativePath: (path: string) => void | Promise<void>;
   onRevealEntry?: (entry: ExplorerEntry) => void;
   revealTargetName?: string;
-  onDownloadEntry: (entry: ExplorerEntry) => void;
+  onDownloadEntry?: (entry: ExplorerEntry) => void;
   onAddToChat?: (path: string) => void;
   onNewEntry?: (parentPath: string, kind: "file" | "directory") => void;
   onCollapseDirectory?: (path: string) => void;

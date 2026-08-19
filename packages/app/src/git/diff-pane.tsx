@@ -66,6 +66,7 @@ import type { ForgeAuthState } from "@getpaseo/protocol/messages";
 import { useCheckoutGitActionsStore } from "@/git/actions-store";
 import { useToast } from "@/contexts/toast-context";
 import { useSessionStore } from "@/stores/session-store";
+import { isMayaRestrictedServerInfo } from "@/maya-restricted/policy";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { usePanelStore } from "@/stores/panel-store";
@@ -364,6 +365,7 @@ interface ChangesToolbarProps {
   host: "explorer" | "panel";
   isMobile: boolean;
   isRefreshing: boolean;
+  mayaRestricted: boolean;
   layout: "unified" | "split";
   overflowToggleStyle: PressableStyleFn;
   refreshSupported: boolean;
@@ -398,6 +400,7 @@ function ChangesToolbar(props: ChangesToolbarProps) {
     gitActions,
     hasFiles,
     isMobile,
+    mayaRestricted,
     selectedDiffStat,
     serverId,
     treeToggleStyle,
@@ -415,14 +418,16 @@ function ChangesToolbar(props: ChangesToolbarProps) {
           onSelectUncommitted={onSelectUncommitted}
           onSelectBase={onSelectBase}
         />
-        <BranchSwitcher
-          currentBranchName={branchName}
-          serverId={serverId}
-          workspaceId={workspaceId ?? cwd}
-          workspaceDirectory={cwd}
-          isGitCheckout
-          testID="changes-branch-switcher"
-        />
+        {!mayaRestricted ? (
+          <BranchSwitcher
+            currentBranchName={branchName}
+            serverId={serverId}
+            workspaceId={workspaceId ?? cwd}
+            workspaceDirectory={cwd}
+            isGitCheckout
+            testID="changes-branch-switcher"
+          />
+        ) : null}
         {!isMobile && selectedDiffStat ? (
           <DiffStat
             additions={selectedDiffStat.additions}
@@ -439,7 +444,7 @@ function ChangesToolbar(props: ChangesToolbarProps) {
             onToggle={onToggleDesktopTree}
           />
         ) : null}
-        {isMobile ? <GitActionsSplitButton gitActions={gitActions} /> : null}
+        {isMobile && !mayaRestricted ? <GitActionsSplitButton gitActions={gitActions} /> : null}
         <ChangesOptionsMenu {...props} />
       </View>
     </View>
@@ -1085,6 +1090,9 @@ export function ChangesSurface({
   onOpenFile,
   onAddToChat,
 }: ChangesSurfaceProps) {
+  const mayaRestricted = useSessionStore((state) =>
+    isMayaRestrictedServerInfo(state.sessions[serverId]?.serverInfo),
+  );
   const { settings: appSettings } = useAppSettings();
   const { t } = useTranslation();
   const isMobile = useIsCompactFormFactor();
@@ -1208,7 +1216,7 @@ export function ChangesSurface({
   } = useCheckoutPrStatusQuery({
     serverId,
     cwd,
-    enabled: isGit,
+    enabled: isGit && !mayaRestricted,
   });
   const forgeProvidersSupported = useSessionStore(
     (s) => s.sessions[serverId]?.serverInfo?.features?.forgeProviders === true,
@@ -1327,7 +1335,7 @@ export function ChangesSurface({
       onCopyRelativePath: handleCopyRelativePath,
       onReveal: fileManagerTarget ? handleRevealPath : undefined,
       revealTargetName: fileManagerTarget?.label,
-      onDownload: handleDownloadPath,
+      onDownload: mayaRestricted ? undefined : handleDownloadPath,
       onDuplicate: fsEntryDuplicateEnabled ? handleDuplicatePath : undefined,
       onRevert: onRevertPath,
     }),
@@ -1343,6 +1351,7 @@ export function ChangesSurface({
       handleCopyPath,
       handleCopyRelativePath,
       handleDownloadPath,
+      mayaRestricted,
       handleDuplicatePath,
       handleRevealPath,
       fileManagerTarget,
@@ -1448,6 +1457,7 @@ export function ChangesSurface({
           hideWhitespace={changesPreferences.hideWhitespace}
           host={host}
           isMobile={isMobile}
+          mayaRestricted={mayaRestricted}
           isRefreshing={isRefreshing}
           layout={changesPreferences.layout}
           overflowToggleStyle={overflowToggleStyle}

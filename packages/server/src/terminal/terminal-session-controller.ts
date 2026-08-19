@@ -36,6 +36,7 @@ import type { TerminalManager, TerminalsChangedEvent } from "./terminal-manager.
 import { applyTerminalSize } from "./terminal-size-ownership.js";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import { terminalSubscriptionKey } from "@getpaseo/protocol/terminal-subscription-key";
+import type { MayaRestrictedWorkspaceAuthority } from "../server/maya-restricted-mode.js";
 
 const MAX_TERMINAL_STREAM_SLOTS = 256;
 
@@ -71,6 +72,10 @@ export interface TerminalSessionControllerOptions {
   sessionLogger: pino.Logger;
   listTerminalWorkspaceRefs?: () => Promise<readonly TerminalWorkspaceRef[]>;
   listTerminalWorkspaceRoots?: () => Promise<readonly string[]>;
+  acquireMayaRestrictedWorkspaceAuthority?: (
+    cwd: string,
+    workspaceId: string,
+  ) => Promise<MayaRestrictedWorkspaceAuthority>;
   // Whether the connected client can reflow restored snapshots. When true the
   // daemon attaches per-row soft-wrap flags to snapshots; otherwise it omits them
   // so old (strict-schema) clients still parse the snapshot.
@@ -129,6 +134,9 @@ export class TerminalSessionController {
   private readonly sessionLogger: pino.Logger;
   private readonly listTerminalWorkspaceRefs: () => Promise<readonly TerminalWorkspaceRef[]>;
   private readonly listTerminalWorkspaceRoots: () => Promise<readonly string[]>;
+  private readonly acquireMayaRestrictedWorkspaceAuthority:
+    | ((cwd: string, workspaceId: string) => Promise<MayaRestrictedWorkspaceAuthority>)
+    | null;
   private readonly clientSupportsWrapReflow: () => boolean;
   private readonly getClientBufferedAmount: () => number | null;
   private readonly terminalSizeOwner = {};
@@ -143,6 +151,14 @@ export class TerminalSessionController {
   >();
   private unsubscribeTerminalsChanged: (() => void) | null = null;
   private readonly exitSubscriptions = new Map<string, () => void>();
+  private readonly restrictedTerminalAuthorities = new Map<
+    string,
+    MayaRestrictedWorkspaceAuthority
+  >();
+  private readonly restrictedDirectoryAuthorities = new Map<
+    string,
+    MayaRestrictedWorkspaceAuthority
+  >();
   private readonly activeStreams = new Map<number, ActiveTerminalStream>();
   private readonly idToSlot = new Map<string, number>();
   private nextSlot = 0;
@@ -158,6 +174,8 @@ export class TerminalSessionController {
     this.listTerminalWorkspaceRoots =
       options.listTerminalWorkspaceRoots ??
       (async () => (await this.listTerminalWorkspaceRefs()).map((workspace) => workspace.cwd));
+    this.acquireMayaRestrictedWorkspaceAuthority =
+      options.acquireMayaRestrictedWorkspaceAuthority ?? null;
     this.clientSupportsWrapReflow = options.clientSupportsWrapReflow ?? (() => false);
     this.getClientBufferedAmount = options.getClientBufferedAmount ?? (() => 0);
   }
@@ -178,41 +196,44 @@ export class TerminalSessionController {
     };
   }
 
-  dispatch(msg: SessionInboundMessage): Promise<void> | undefined {
+  dispatch(
+    msg: SessionInboundMessage,
+    options: {
+      mayaRestrictedMode?: boolean;
+      workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null;
+    } = {},
+  ): Promise<void> | undefined {
     if (!isTerminalMessage(msg)) {
       return undefined;
     }
     switch (msg.type) {
       case "subscribe_terminals_request":
-        this.handleSubscribeTerminalsRequest(msg);
-        return undefined;
+        return this.handleSubscribeTerminalsRequest(msg, options);
       case "unsubscribe_terminals_request":
-        this.handleUnsubscribeTerminalsRequest(msg);
-        return undefined;
+        return this.handleUnsubscribeTerminalsRequest(msg, options);
       case "list_terminals_request":
-        return this.handleListTerminalsRequest(msg);
+        return this.handleListTerminalsRequest(msg, options);
       case "create_terminal_request":
-        return this.handleCreateTerminalRequest(msg);
+        return this.handleCreateTerminalRequest(msg, options);
       case "subscribe_terminal_request":
-        return this.handleSubscribeTerminalRequest(msg);
+        return this.handleSubscribeTerminalRequest(msg, options.mayaRestrictedMode === true);
       case "unsubscribe_terminal_request":
         this.handleUnsubscribeTerminalRequest(msg);
         return undefined;
       case "terminal_input":
-        this.handleTerminalInput(msg);
-        return undefined;
+        return this.handleTerminalInput(msg, options.mayaRestrictedMode === true);
       case "kill_terminal_request":
-        return this.handleKillTerminalRequest(msg);
+        return this.handleKillTerminalRequest(msg, options.mayaRestrictedMode === true);
       case "capture_terminal_request":
-        return this.handleCaptureTerminalRequest(msg);
+        return this.handleCaptureTerminalRequest(msg, options.mayaRestrictedMode === true);
       case "terminal.rename.request":
-        return this.handleRenameTerminalRequest(msg);
+        return this.handleRenameTerminalRequest(msg, options.mayaRestrictedMode === true);
       default:
         return undefined;
     }
   }
 
-  handleBinaryFrame(frame: TerminalStreamFrame): void {
+  async handleBinaryFrame(frame: TerminalStreamFrame, mayaRestrictedMode = false): Promise<void> {
     const activeStream = this.activeStreams.get(frame.slot);
     if (!activeStream || !this.terminalManager) {
       return;
@@ -220,6 +241,10 @@ export class TerminalSessionController {
     const terminal = this.terminalManager.getTerminal(activeStream.terminalId);
     if (!terminal) {
       this.detachStream(activeStream.terminalId, { emitExit: true });
+      return;
+    }
+    if (mayaRestrictedMode && !(await this.validateRestrictedTerminalAuthority(terminal))) {
+      this.killTracked(terminal.id, { emitExit: true });
       return;
     }
 
@@ -284,6 +309,81 @@ export class TerminalSessionController {
     for (const terminalId of Array.from(this.idToSlot.keys())) {
       this.detachStream(terminalId, { emitExit: false });
     }
+    for (const authority of this.restrictedTerminalAuthorities.values()) {
+      void authority.release();
+    }
+    this.restrictedTerminalAuthorities.clear();
+    for (const authority of this.restrictedDirectoryAuthorities.values()) {
+      void authority.release();
+    }
+    this.restrictedDirectoryAuthorities.clear();
+  }
+
+  private async replaceRestrictedDirectoryAuthority(
+    key: string,
+    authority: MayaRestrictedWorkspaceAuthority,
+  ): Promise<void> {
+    const previous = this.restrictedDirectoryAuthorities.get(key);
+    this.restrictedDirectoryAuthorities.set(key, authority.retain());
+    await previous?.release();
+  }
+
+  private async releaseRestrictedDirectoryAuthority(key: string): Promise<void> {
+    const authority = this.restrictedDirectoryAuthorities.get(key);
+    if (!authority) return;
+    this.restrictedDirectoryAuthorities.delete(key);
+    await authority.release();
+  }
+
+  private async bindRestrictedTerminalAuthority(
+    terminal: TerminalSession,
+    authority: MayaRestrictedWorkspaceAuthority,
+  ): Promise<void> {
+    if (terminal.cwd !== authority.cwd || terminal.workspaceId !== authority.workspaceId) {
+      throw new Error("terminal identity does not match selected workspace authority");
+    }
+    if (!(await authority.isCurrent())) {
+      throw new Error("terminal workspace authority changed during admission");
+    }
+    const previous = this.restrictedTerminalAuthorities.get(terminal.id);
+    if (previous === authority) return;
+    this.restrictedTerminalAuthorities.set(terminal.id, authority.retain());
+    await previous?.release();
+  }
+
+  private async validateRestrictedTerminalAuthority(terminal: TerminalSession): Promise<boolean> {
+    const authority = this.restrictedTerminalAuthorities.get(terminal.id);
+    if (!authority) return false;
+    if (
+      terminal.cwd !== authority.cwd ||
+      terminal.workspaceId !== authority.workspaceId ||
+      !(await authority.isCurrent())
+    ) {
+      this.restrictedTerminalAuthorities.delete(terminal.id);
+      await authority.release();
+      return false;
+    }
+    return true;
+  }
+
+  private async ensureRestrictedTerminalAuthority(terminal: TerminalSession): Promise<boolean> {
+    if (await this.validateRestrictedTerminalAuthority(terminal)) return true;
+    const acquire = this.acquireMayaRestrictedWorkspaceAuthority;
+    if (!acquire) return false;
+    let authority: MayaRestrictedWorkspaceAuthority | null = null;
+    try {
+      authority = await acquire(terminal.cwd, terminal.workspaceId);
+      await this.bindRestrictedTerminalAuthority(terminal, authority);
+      return true;
+    } catch (error) {
+      this.sessionLogger.warn(
+        { err: error, terminalId: terminal.id },
+        "Rejected terminal with stale Maya workspace authority",
+      );
+      return false;
+    } finally {
+      await authority?.release();
+    }
   }
 
   private ensureExitSubscription(terminal: TerminalSession): void {
@@ -301,6 +401,11 @@ export class TerminalSessionController {
     if (unsubscribeExit) {
       unsubscribeExit();
       this.exitSubscriptions.delete(terminalId);
+    }
+    const authority = this.restrictedTerminalAuthorities.get(terminalId);
+    if (authority) {
+      this.restrictedTerminalAuthorities.delete(terminalId);
+      void authority.release();
     }
     this.detachStream(terminalId, { emitExit: true });
   }
@@ -358,14 +463,42 @@ export class TerminalSessionController {
     }
   }
 
-  private handleSubscribeTerminalsRequest(msg: SubscribeTerminalsRequest): void {
+  private async handleSubscribeTerminalsRequest(
+    msg: SubscribeTerminalsRequest,
+    options: {
+      mayaRestrictedMode?: boolean;
+      workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null;
+    },
+  ): Promise<void> {
     const subscription = { cwd: msg.cwd, workspaceId: msg.workspaceId };
-    this.subscribedDirectories.set(terminalSubscriptionKey(msg.cwd, msg.workspaceId), subscription);
-    void this.emitTerminalsSnapshotForSubscription(subscription);
+    const key = terminalSubscriptionKey(msg.cwd, msg.workspaceId);
+    if (options.mayaRestrictedMode) {
+      const authority = options.workspaceAuthority;
+      if (!authority || msg.workspaceId !== authority.workspaceId || msg.cwd !== authority.cwd) {
+        throw new Error("terminal directory subscription lacks selected workspace authority");
+      }
+      await this.replaceRestrictedDirectoryAuthority(key, authority);
+    }
+    this.subscribedDirectories.set(key, subscription);
+    await this.emitTerminalsSnapshotForSubscription(subscription);
   }
 
-  private handleUnsubscribeTerminalsRequest(msg: UnsubscribeTerminalsRequest): void {
-    this.subscribedDirectories.delete(terminalSubscriptionKey(msg.cwd, msg.workspaceId));
+  private async handleUnsubscribeTerminalsRequest(
+    msg: UnsubscribeTerminalsRequest,
+    options: {
+      mayaRestrictedMode?: boolean;
+      workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null;
+    },
+  ): Promise<void> {
+    const key = terminalSubscriptionKey(msg.cwd, msg.workspaceId);
+    if (options.mayaRestrictedMode) {
+      const authority = options.workspaceAuthority;
+      if (!authority || msg.workspaceId !== authority.workspaceId || msg.cwd !== authority.cwd) {
+        throw new Error("terminal directory unsubscription lacks selected workspace authority");
+      }
+    }
+    this.subscribedDirectories.delete(key);
+    await this.releaseRestrictedDirectoryAuthority(key);
   }
 
   private async emitTerminalsSnapshotForSubscription(subscription: {
@@ -377,12 +510,21 @@ export class TerminalSessionController {
       return;
     }
     try {
+      const restrictedAuthority = this.restrictedDirectoryAuthorities.get(key);
+      if (restrictedAuthority && !(await restrictedAuthority.isCurrent())) {
+        this.subscribedDirectories.delete(key);
+        await this.releaseRestrictedDirectoryAuthority(key);
+        return;
+      }
       const terminals = await this.getTerminalsForWorkspaceRoot(
         subscription.cwd,
         subscription.workspaceId,
       );
       for (const terminal of terminals) {
         this.ensureExitSubscription(terminal);
+        if (restrictedAuthority) {
+          await this.bindRestrictedTerminalAuthority(terminal, restrictedAuthority);
+        }
       }
       if (!this.subscribedDirectories.has(key)) {
         return;
@@ -399,7 +541,13 @@ export class TerminalSessionController {
     }
   }
 
-  private async handleListTerminalsRequest(msg: ListTerminalsRequest): Promise<void> {
+  private async handleListTerminalsRequest(
+    msg: ListTerminalsRequest,
+    options: {
+      mayaRestrictedMode?: boolean;
+      workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null;
+    },
+  ): Promise<void> {
     if (!this.terminalManager) {
       this.emit({
         type: "list_terminals_response",
@@ -413,12 +561,26 @@ export class TerminalSessionController {
     }
 
     try {
+      if (options.mayaRestrictedMode) {
+        const authority = options.workspaceAuthority;
+        if (
+          !authority ||
+          !msg.cwd ||
+          msg.cwd !== authority.cwd ||
+          msg.workspaceId !== authority.workspaceId
+        ) {
+          throw new Error("terminal listing lacks selected workspace authority");
+        }
+      }
       const terminals =
         typeof msg.cwd === "string"
           ? await this.getTerminalsForWorkspaceRoot(msg.cwd, msg.workspaceId)
           : await this.getAllTerminalSessions();
       for (const terminal of terminals) {
         this.ensureExitSubscription(terminal);
+        if (options.mayaRestrictedMode && options.workspaceAuthority) {
+          await this.bindRestrictedTerminalAuthority(terminal, options.workspaceAuthority);
+        }
       }
       this.emit({
         type: "list_terminals_response",
@@ -506,7 +668,13 @@ export class TerminalSessionController {
     );
   }
 
-  private async handleCreateTerminalRequest(msg: CreateTerminalRequest): Promise<void> {
+  private async handleCreateTerminalRequest(
+    msg: CreateTerminalRequest,
+    options: {
+      mayaRestrictedMode?: boolean;
+      workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null;
+    },
+  ): Promise<void> {
     if (!this.terminalManager) {
       this.emit({
         type: "create_terminal_response",
@@ -520,6 +688,19 @@ export class TerminalSessionController {
     }
 
     try {
+      if (options.mayaRestrictedMode) {
+        const authority = options.workspaceAuthority;
+        if (
+          !authority ||
+          msg.cwd !== authority.cwd ||
+          msg.workspaceId !== authority.workspaceId ||
+          msg.agentId !== undefined ||
+          msg.command !== undefined ||
+          msg.args !== undefined
+        ) {
+          throw new Error("terminal creation lacks exact selected workspace authority");
+        }
+      }
       if (msg.agentId) {
         this.emit({
           type: "create_terminal_response",
@@ -555,6 +736,9 @@ export class TerminalSessionController {
         cols: msg.size?.cols,
       });
       this.ensureExitSubscription(session);
+      if (options.mayaRestrictedMode && options.workspaceAuthority) {
+        await this.bindRestrictedTerminalAuthority(session, options.workspaceAuthority);
+      }
       this.emit({
         type: "create_terminal_response",
         payload: {
@@ -608,7 +792,10 @@ export class TerminalSessionController {
     );
   }
 
-  private async handleRenameTerminalRequest(msg: RenameTerminalRequest): Promise<void> {
+  private async handleRenameTerminalRequest(
+    msg: RenameTerminalRequest,
+    mayaRestrictedMode: boolean,
+  ): Promise<void> {
     const respond = (success: boolean, error: string | null): void => {
       this.emit({
         type: "terminal.rename.response",
@@ -630,11 +817,23 @@ export class TerminalSessionController {
       return;
     }
 
+    const session = this.terminalManager.getTerminal(msg.terminalId);
+    if (
+      mayaRestrictedMode &&
+      (!session || !(await this.ensureRestrictedTerminalAuthority(session)))
+    ) {
+      respond(false, "Terminal workspace authority is unavailable");
+      return;
+    }
+
     const renamed = this.terminalManager.setTerminalTitle(msg.terminalId, title);
     respond(renamed, renamed ? null : "Terminal not found");
   }
 
-  private async handleSubscribeTerminalRequest(msg: SubscribeTerminalRequest): Promise<void> {
+  private async handleSubscribeTerminalRequest(
+    msg: SubscribeTerminalRequest,
+    mayaRestrictedMode: boolean,
+  ): Promise<void> {
     if (!this.terminalManager) {
       this.emit({
         type: "subscribe_terminal_response",
@@ -654,6 +853,17 @@ export class TerminalSessionController {
         payload: {
           terminalId: msg.terminalId,
           error: "Terminal not found",
+          requestId: msg.requestId,
+        },
+      });
+      return;
+    }
+    if (mayaRestrictedMode && !(await this.ensureRestrictedTerminalAuthority(session))) {
+      this.emit({
+        type: "subscribe_terminal_response",
+        payload: {
+          terminalId: msg.terminalId,
+          error: "Terminal workspace authority is unavailable",
           requestId: msg.requestId,
         },
       });
@@ -708,13 +918,20 @@ export class TerminalSessionController {
     this.detachStream(msg.terminalId, { emitExit: false });
   }
 
-  private handleTerminalInput(msg: TerminalInput): void {
+  private async handleTerminalInput(
+    msg: TerminalInput,
+    mayaRestrictedMode: boolean,
+  ): Promise<void> {
     if (!this.terminalManager) {
       return;
     }
     const session = this.terminalManager.getTerminal(msg.terminalId);
     if (!session) {
       this.sessionLogger.warn({ terminalId: msg.terminalId }, "Terminal not found for input");
+      return;
+    }
+    if (mayaRestrictedMode && !(await this.ensureRestrictedTerminalAuthority(session))) {
+      this.killTracked(session.id, { emitExit: true });
       return;
     }
     this.ensureExitSubscription(session);
@@ -732,7 +949,20 @@ export class TerminalSessionController {
     this.terminalManager?.killTerminal(terminalId);
   }
 
-  private async handleKillTerminalRequest(msg: KillTerminalRequest): Promise<void> {
+  private async handleKillTerminalRequest(
+    msg: KillTerminalRequest,
+    mayaRestrictedMode: boolean,
+  ): Promise<void> {
+    if (mayaRestrictedMode) {
+      const terminal = this.terminalManager?.getTerminal(msg.terminalId);
+      if (!terminal || !(await this.ensureRestrictedTerminalAuthority(terminal))) {
+        this.emit({
+          type: "kill_terminal_response",
+          payload: { terminalId: msg.terminalId, success: false, requestId: msg.requestId },
+        });
+        return;
+      }
+    }
     const result = this.killTerminalForClose(msg.terminalId);
     this.emit({
       type: "kill_terminal_response",
@@ -744,7 +974,10 @@ export class TerminalSessionController {
     });
   }
 
-  private async handleCaptureTerminalRequest(msg: CaptureTerminalRequest): Promise<void> {
+  private async handleCaptureTerminalRequest(
+    msg: CaptureTerminalRequest,
+    mayaRestrictedMode: boolean,
+  ): Promise<void> {
     if (!this.terminalManager) {
       this.emit({
         type: "capture_terminal_response",
@@ -760,6 +993,18 @@ export class TerminalSessionController {
 
     const session = this.terminalManager.getTerminal(msg.terminalId);
     if (!session) {
+      this.emit({
+        type: "capture_terminal_response",
+        payload: {
+          terminalId: msg.terminalId,
+          lines: [],
+          totalLines: 0,
+          requestId: msg.requestId,
+        },
+      });
+      return;
+    }
+    if (mayaRestrictedMode && !(await this.ensureRestrictedTerminalAuthority(session))) {
       this.emit({
         type: "capture_terminal_response",
         payload: {
@@ -930,6 +1175,13 @@ export class TerminalSessionController {
     const terminal = terminalManager.getTerminal(activeStream.terminalId);
     if (!terminal) {
       this.detachStream(activeStream.terminalId, { emitExit: true });
+      return;
+    }
+    if (
+      this.restrictedTerminalAuthorities.has(terminal.id) &&
+      !(await this.validateRestrictedTerminalAuthority(terminal))
+    ) {
+      this.killTracked(terminal.id, { emitExit: true });
       return;
     }
     if (activeStream.restore && activeStream.readyRevision === undefined) {

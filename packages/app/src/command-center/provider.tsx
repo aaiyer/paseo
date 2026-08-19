@@ -2,21 +2,34 @@ import {
   createContext,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useSyncExternalStore,
   type ReactNode,
 } from "react";
 import type { CommandCenterContribution } from "./contributions";
 import { createCommandCenterRegistry, type CommandCenterRegistry } from "./registry";
+import { filterMayaRestrictedCommandRegistration } from "@/maya-restricted/policy";
 
 const CommandCenterRegistryContext = createContext<CommandCenterRegistry | null>(null);
 
-export function CommandCenterProvider({ children }: { children: ReactNode }) {
-  const registryRef = useRef<CommandCenterRegistry | null>(null);
-  if (!registryRef.current) registryRef.current = createCommandCenterRegistry();
+export function CommandCenterProvider({
+  children,
+  mayaRestricted,
+}: {
+  children: ReactNode;
+  mayaRestricted: boolean;
+}) {
+  const registry = useMemo<CommandCenterRegistry>(
+    () =>
+      createCommandCenterRegistry((registration) =>
+        mayaRestricted ? filterMayaRestrictedCommandRegistration(registration) : registration,
+      ),
+    [mayaRestricted],
+  );
 
   return (
-    <CommandCenterRegistryContext.Provider value={registryRef.current}>
+    <CommandCenterRegistryContext.Provider value={registry}>
       {children}
     </CommandCenterRegistryContext.Provider>
   );

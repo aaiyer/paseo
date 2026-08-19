@@ -201,7 +201,10 @@ import {
   WORKSPACE_SEARCH_HIDDEN_DIRECTORIES,
 } from "../utils/directory-suggestions.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
-import type { MayaRestrictedWorkspaceAuthority } from "./maya-restricted-mode.js";
+import {
+  acquireMayaRestrictedWorkspaceSelectionAuthority,
+  type MayaRestrictedWorkspaceAuthority,
+} from "./maya-restricted-mode.js";
 import type { Resolvable } from "./speech/provider-resolver.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
 import type pino from "pino";
@@ -950,6 +953,12 @@ export class Session {
       isPathWithinRoot: (rootPath, candidatePath) => this.isPathWithinRoot(rootPath, candidatePath),
       sessionLogger: this.sessionLogger,
       listTerminalWorkspaceRefs: () => this.listActiveWorkspaceRefs(),
+      acquireMayaRestrictedWorkspaceAuthority: async (cwd, workspaceId) =>
+        acquireMayaRestrictedWorkspaceSelectionAuthority(
+          cwd,
+          workspaceId,
+          await this.workspaceRegistry.list(),
+        ),
       clientSupportsWrapReflow: () =>
         this.clientCapabilities.has(CLIENT_CAPS.terminalReflowableSnapshot),
       getClientBufferedAmount: () => this.getTransportBufferedAmount(),
@@ -1901,7 +1910,7 @@ export class Session {
       this.dispatchOrchestrationSkillsMessage(msg) ??
       this.dispatchPluginDirectoryMessage(msg) ??
       this.dispatchPluginMessage(msg) ??
-      this.dispatchTerminalMessage(msg) ??
+      this.dispatchTerminalMessage(msg, workspaceAuthority, mayaRestrictedMode) ??
       this.dispatchScheduleMessage(msg) ??
       this.dispatchMiscMessage(msg);
     if (promise) await promise;
@@ -2489,7 +2498,11 @@ export class Session {
     }
   }
 
-  private dispatchTerminalMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchTerminalMessage(
+    msg: SessionInboundMessage,
+    workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null,
+    mayaRestrictedMode = false,
+  ): Promise<void> | undefined {
     switch (msg.type) {
       case "start_workspace_script_request":
         return this.handleStartWorkspaceScriptRequest(msg);
@@ -2500,7 +2513,7 @@ export class Session {
       case "workspace.script.stop.request":
         return this.handleWorkspaceScriptStopRequest(msg);
       default:
-        return this.terminalController.dispatch(msg);
+        return this.terminalController.dispatch(msg, { workspaceAuthority, mayaRestrictedMode });
     }
   }
 
@@ -2558,12 +2571,15 @@ export class Session {
     return this.sessionId;
   }
 
-  public async handleBinaryFrame(binaryFrame: BinaryFrame): Promise<void> {
+  public async handleBinaryFrame(
+    binaryFrame: BinaryFrame,
+    mayaRestrictedMode = false,
+  ): Promise<void> {
     if (binaryFrame.kind === "file_transfer") {
       await this.workspaceFilesSession.handleFileTransferFrame(binaryFrame.frame);
       return;
     }
-    this.terminalController.handleBinaryFrame(binaryFrame.frame);
+    await this.terminalController.handleBinaryFrame(binaryFrame.frame, mayaRestrictedMode);
   }
 
   private async handleRestartServerRequest(requestId: string, reason?: string): Promise<void> {
