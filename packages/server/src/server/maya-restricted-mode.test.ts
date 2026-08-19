@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -458,12 +458,24 @@ describe("Maya restricted mode", () => {
       requestId: "terminal",
     };
     expect(evaluate(base)).toEqual({ allowed: true, reason: "allowed" });
-    expect(evaluate({ ...base, cwd: "/srv/maya/other" })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, workspaceId: "archived" })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, workspaceId: undefined })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, command: "/bin/sh" })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, args: ["-c", "id"] })).toMatchObject({ allowed: false });
-    expect(evaluate({ ...base, agentId: "agent" })).toMatchObject({ allowed: false });
+    expect(evaluate({ ...base, cwd: "/srv/maya/other" })).toMatchObject({
+      allowed: false,
+    });
+    expect(evaluate({ ...base, workspaceId: "archived" })).toMatchObject({
+      allowed: false,
+    });
+    expect(evaluate({ ...base, workspaceId: undefined })).toMatchObject({
+      allowed: false,
+    });
+    expect(evaluate({ ...base, command: "/bin/sh" })).toMatchObject({
+      allowed: false,
+    });
+    expect(evaluate({ ...base, args: ["-c", "id"] })).toMatchObject({
+      allowed: false,
+    });
+    expect(evaluate({ ...base, agentId: "agent" })).toMatchObject({
+      allowed: false,
+    });
 
     for (const type of [
       "list_terminals_request",
@@ -471,7 +483,12 @@ describe("Maya restricted mode", () => {
       "unsubscribe_terminals_request",
     ] as const) {
       expect(
-        evaluate({ type, cwd: base.cwd, workspaceId: base.workspaceId, requestId: "list" }),
+        evaluate({
+          type,
+          cwd: base.cwd,
+          workspaceId: base.workspaceId,
+          requestId: "list",
+        }),
       ).toEqual({ allowed: true, reason: "allowed" });
       expect(evaluate({ type, cwd: base.cwd, requestId: "unbound" })).toMatchObject({
         allowed: false,
@@ -590,6 +607,10 @@ describe("Maya restricted mode", () => {
 
         await writeFile(path.join(selected, ".git"), selectedLink);
         restoreHook = installAfterMayaAuthorityValidationHookForTest(async () => {
+          await authority?.release();
+          authority = null;
+          await rename(selected, `${selected}-replaced`);
+          await mkdir(selected);
           await writeFile(path.join(selected, ".git"), siblingLink);
         });
         const result = await runGitCommand(["rev-parse", "--abbrev-ref", "HEAD"], {
@@ -602,6 +623,47 @@ describe("Maya restricted mode", () => {
         if (authority) {
           await authority.release();
         }
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "rejects linked-worktree Git indirection FIFOs without blocking authority admission",
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), "maya-restricted-git-fifo-"));
+      const repository = path.join(root, "repository");
+      const selected = path.join(root, "selected");
+      try {
+        execFileSync("git", ["init", "--initial-branch=main", repository]);
+        execFileSync("git", ["-C", repository, "config", "user.name", "Paseo Test"]);
+        execFileSync("git", ["-C", repository, "config", "user.email", "paseo@example.invalid"]);
+        execFileSync("git", ["-C", repository, "commit", "--allow-empty", "-m", "base"]);
+        execFileSync("git", ["-C", repository, "branch", "selected"]);
+        execFileSync("git", ["-C", repository, "worktree", "add", selected, "selected"]);
+        const dotGit = await readFile(path.join(selected, ".git"), "utf8");
+        const gitDirectory = path.resolve(selected, dotGit.trim().slice("gitdir: ".length));
+
+        for (const name of ["commondir", "gitdir"]) {
+          const indirection = path.join(gitDirectory, name);
+          const contents = await readFile(indirection);
+          await rm(indirection);
+          execFileSync("/usr/bin/mkfifo", [indirection]);
+          await expect(
+            Promise.race([
+              openMayaRestrictedWorkspaceAuthority(selected).then(async (opened) => {
+                await opened.release();
+                throw new Error("FIFO authority admission unexpectedly succeeded");
+              }),
+              new Promise<never>((_resolve, reject) =>
+                setTimeout(() => reject(new Error("FIFO authority admission blocked")), 1_000),
+              ),
+            ]),
+          ).rejects.toThrow("Git path indirection is unsafe");
+          await rm(indirection);
+          await writeFile(indirection, contents);
+        }
+      } finally {
         await rm(root, { recursive: true, force: true });
       }
     },

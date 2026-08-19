@@ -66,7 +66,7 @@ const ALLOWED = { allowed: true, reason: "allowed" } as const;
 const MAYA_WORKSPACE_IDENTITY_DOMAIN = "maya-paseo-workspace-identity-v1";
 const MAX_GIT_LINK_BYTES = 4096;
 const OPEN_DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const OPEN_FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW;
+const OPEN_FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 let nextAuthorityCacheId = 1;
 const activeAuthorities = new Map<string, OpenMayaRestrictedWorkspaceAuthority>();
 const authorityOpenPromises = new Map<string, Promise<OpenMayaRestrictedWorkspaceAuthority>>();
@@ -99,6 +99,7 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
     private readonly dotGitHandle: FileHandle | null,
     private readonly gitDirectoryHandle: FileHandle,
     private readonly commonDirectoryHandle: FileHandle,
+    private readonly gitDirectoryRelativeToCommon: string,
   ) {}
 
   activateBinding(): void {
@@ -110,9 +111,15 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
       cwd: this.cwd,
       rootAccessPath: this.rootAccessPath,
       gitLaunchContext: {
+        workspacePath: this.cwd,
+        gitDirectoryRelativeToCommon: this.gitDirectoryRelativeToCommon,
         rootHandle: this.rootHandle,
         gitDirectoryHandle: this.gitDirectoryHandle,
         commonDirectoryHandle: this.commonDirectoryHandle,
+      },
+      retainAuthority: () => {
+        this.retain();
+        return () => this.release();
       },
       validateGitAssociation: () => this.validateGitAssociation(),
     });
@@ -414,13 +421,19 @@ async function openFreshMayaRestrictedWorkspaceAuthority(
 
     commonDirectoryHandle ??= await fs.open(commonDirectory, OPEN_DIRECTORY_FLAGS);
     const commonDirectoryAccessPath = `/proc/self/fd/${commonDirectoryHandle.fd}`;
-    const [canonicalCommonDirectory, commonMetadata, finalRoot, finalRootMetadata] =
-      await Promise.all([
-        fs.realpath(commonDirectoryAccessPath),
-        commonDirectoryHandle.stat({ bigint: true }),
-        fs.realpath(rootAccessPath),
-        rootHandle.stat({ bigint: true }),
-      ]);
+    const [
+      canonicalGitDirectory,
+      canonicalCommonDirectory,
+      commonMetadata,
+      finalRoot,
+      finalRootMetadata,
+    ] = await Promise.all([
+      fs.realpath(`/proc/self/fd/${gitDirectoryHandle.fd}`),
+      fs.realpath(commonDirectoryAccessPath),
+      commonDirectoryHandle.stat({ bigint: true }),
+      fs.realpath(rootAccessPath),
+      rootHandle.stat({ bigint: true }),
+    ]);
     if (!commonMetadata.isDirectory()) throw new Error("Git common directory is unsafe");
     if (
       finalRoot !== root ||
@@ -443,6 +456,17 @@ async function openFreshMayaRestrictedWorkspaceAuthority(
       digest.update("\0");
     }
     if (!gitDirectoryHandle) throw new Error("workspace Git directory is absent");
+    const gitDirectoryRelativeToCommon = path.relative(
+      canonicalCommonDirectory,
+      canonicalGitDirectory,
+    );
+    if (
+      path.isAbsolute(gitDirectoryRelativeToCommon) ||
+      gitDirectoryRelativeToCommon === ".." ||
+      gitDirectoryRelativeToCommon.startsWith(`..${path.sep}`)
+    ) {
+      throw new Error("workspace Git directory is outside its common directory");
+    }
     const authority = new OpenMayaRestrictedWorkspaceAuthority(
       root,
       `wks_${digest.digest("hex").slice(0, 16)}`,
@@ -451,6 +475,7 @@ async function openFreshMayaRestrictedWorkspaceAuthority(
       dotGitHandle,
       gitDirectoryHandle,
       commonDirectoryHandle,
+      gitDirectoryRelativeToCommon || ".",
     );
     await authority.validateGitAssociation();
     authority.activateBinding();

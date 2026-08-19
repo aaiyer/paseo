@@ -18,6 +18,10 @@ import {
 } from "./git-command-trace.js";
 import { spawnProcess } from "./spawn.js";
 import {
+  buildMayaRestrictedSandboxArgs,
+  MAYA_RESTRICTED_BWRAP,
+} from "../server/maya-restricted-sandbox.js";
+import {
   GitProcessScheduler,
   type GitProcessPriority,
   resolveGitProcessPolicy,
@@ -285,17 +289,27 @@ export function runGitCommand(
   if (args.includes("--textconv") || args.includes("--ext-diff")) {
     return Promise.reject(new Error("Maya restricted Git executable diff helpers are disabled"));
   }
-  return authority.validateGitAssociation().then(async () => {
-    const hook = afterMayaAuthorityValidationForTest;
-    afterMayaAuthorityValidationForTest = null;
-    await hook?.();
-    if (!authority.gitLaunchContext) {
-      throw new Error("Maya restricted Git launch context is absent");
+  const releaseAuthority = authority.retainAuthority();
+  return (async () => {
+    try {
+      await authority.validateGitAssociation();
+      const hook = afterMayaAuthorityValidationForTest;
+      afterMayaAuthorityValidationForTest = null;
+      await hook?.();
+      if (!authority.gitLaunchContext) {
+        throw new Error("Maya restricted Git launch context is absent");
+      }
+      const restrictedArgs =
+        args[0] === "diff" ? [args[0], "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
+      return await runGitCommandWithBoundOptions(
+        restrictedArgs,
+        options,
+        authority.gitLaunchContext,
+      );
+    } finally {
+      await releaseAuthority();
     }
-    const restrictedArgs =
-      args[0] === "diff" ? [args[0], "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
-    return runGitCommandWithBoundOptions(restrictedArgs, options, authority.gitLaunchContext);
-  });
+  })();
 }
 
 function runGitCommandWithBoundOptions(
@@ -327,9 +341,12 @@ function runGitCommandWithBoundOptions(
       const mayaGitEnvironment: ProcessEnvRecord | undefined = mayaLaunchContext
         ? Object.assign(
             {
-              GIT_WORK_TREE: `/proc/self/fd/${MAYA_ROOT_CHILD_FD}`,
-              GIT_DIR: `/proc/self/fd/${MAYA_GIT_DIRECTORY_CHILD_FD}`,
-              GIT_COMMON_DIR: `/proc/self/fd/${MAYA_COMMON_DIRECTORY_CHILD_FD}`,
+              GIT_WORK_TREE: mayaLaunchContext.workspacePath,
+              GIT_DIR:
+                mayaLaunchContext.gitDirectoryRelativeToCommon === "."
+                  ? "/run/maya-git-common"
+                  : `/run/maya-git-common/${mayaLaunchContext.gitDirectoryRelativeToCommon}`,
+              GIT_COMMON_DIR: "/run/maya-git-common",
               GIT_CONFIG_NOSYSTEM: "1",
               GIT_CONFIG_GLOBAL: "/dev/null",
               GIT_ATTR_NOSYSTEM: "1",
@@ -449,8 +466,38 @@ function runGitCommandWithBoundOptions(
       try {
         // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
         // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
-        child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
-          cwd: mayaLaunchContext ? `/proc/self/fd/${mayaLaunchContext.rootHandle.fd}` : options.cwd,
+        const gitArgs = ["-c", "core.quotepath=false", ...args];
+        const spawnCommand = mayaLaunchContext ? MAYA_RESTRICTED_BWRAP : "git";
+        const spawnArgs = mayaLaunchContext
+          ? buildMayaRestrictedSandboxArgs({
+              cwd: mayaLaunchContext.workspacePath,
+              bindings: [
+                {
+                  fileDescriptor: MAYA_ROOT_CHILD_FD,
+                  destination: mayaLaunchContext.workspacePath,
+                  writable: false,
+                },
+                {
+                  fileDescriptor: MAYA_COMMON_DIRECTORY_CHILD_FD,
+                  destination: "/run/maya-git-common",
+                  writable: false,
+                },
+                ...(mayaLaunchContext.gitDirectoryRelativeToCommon === "."
+                  ? []
+                  : [
+                      {
+                        fileDescriptor: MAYA_GIT_DIRECTORY_CHILD_FD,
+                        destination: `/run/maya-git-common/${mayaLaunchContext.gitDirectoryRelativeToCommon}`,
+                        writable: false,
+                      },
+                    ]),
+              ],
+              command: "/usr/bin/git",
+              args: gitArgs,
+            })
+          : gitArgs;
+        child = spawnProcess(spawnCommand, spawnArgs, {
+          cwd: mayaLaunchContext ? "/" : options.cwd,
           envOverlay,
           shell: false,
           stdio: mayaLaunchContext

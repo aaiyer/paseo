@@ -40,6 +40,8 @@ import type { MayaRestrictedWorkspaceAuthority } from "../server/maya-restricted
 
 const MAX_TERMINAL_STREAM_SLOTS = 256;
 const MAX_RESTRICTED_PENDING_BINARY_FRAMES = 64;
+const MAX_RESTRICTED_PENDING_OUTPUT_FRAMES = 64;
+const MAX_RESTRICTED_PENDING_OUTPUT_BYTES = 1024 * 1024;
 export const MAYA_RESTRICTED_TERMINAL_AUTHORITY_DIAGNOSTIC =
   "maya_restricted_terminal_authority_drift";
 
@@ -60,6 +62,8 @@ interface ActiveTerminalStream {
   bufferedOutputs: BufferedTerminalOutput[];
   outputBytesSinceSnapshot: number;
   restrictedEmissionTail: Promise<void>;
+  restrictedPendingOutputFrames: number;
+  restrictedPendingOutputBytes: number;
   outputCoalescer: TerminalOutputCoalescer;
 }
 
@@ -77,10 +81,6 @@ export interface TerminalSessionControllerOptions {
   sessionLogger: pino.Logger;
   listTerminalWorkspaceRefs?: () => Promise<readonly TerminalWorkspaceRef[]>;
   listTerminalWorkspaceRoots?: () => Promise<readonly string[]>;
-  acquireMayaRestrictedWorkspaceAuthority?: (
-    cwd: string,
-    workspaceId: string,
-  ) => Promise<MayaRestrictedWorkspaceAuthority>;
   // Whether the connected client can reflow restored snapshots. When true the
   // daemon attaches per-row soft-wrap flags to snapshots; otherwise it omits them
   // so old (strict-schema) clients still parse the snapshot.
@@ -139,9 +139,6 @@ export class TerminalSessionController {
   private readonly sessionLogger: pino.Logger;
   private readonly listTerminalWorkspaceRefs: () => Promise<readonly TerminalWorkspaceRef[]>;
   private readonly listTerminalWorkspaceRoots: () => Promise<readonly string[]>;
-  private readonly acquireMayaRestrictedWorkspaceAuthority:
-    | ((cwd: string, workspaceId: string) => Promise<MayaRestrictedWorkspaceAuthority>)
-    | null;
   private readonly clientSupportsWrapReflow: () => boolean;
   private readonly getClientBufferedAmount: () => number | null;
   private readonly terminalSizeOwner = {};
@@ -169,6 +166,8 @@ export class TerminalSessionController {
   private nextSlot = 0;
   private nextStreamGeneration = 1;
   private nextDirectoryGeneration = 1;
+  private nextTerminalAdmissionGeneration = 1;
+  private readonly terminalAdmissionGenerations = new Map<string, number>();
   private restrictedBinaryTail: Promise<void> = Promise.resolve();
   private restrictedPendingBinaryFrames = 0;
 
@@ -183,8 +182,6 @@ export class TerminalSessionController {
     this.listTerminalWorkspaceRoots =
       options.listTerminalWorkspaceRoots ??
       (async () => (await this.listTerminalWorkspaceRefs()).map((workspace) => workspace.cwd));
-    this.acquireMayaRestrictedWorkspaceAuthority =
-      options.acquireMayaRestrictedWorkspaceAuthority ?? null;
     this.clientSupportsWrapReflow = options.clientSupportsWrapReflow ?? (() => false);
     this.getClientBufferedAmount = options.getClientBufferedAmount ?? (() => 0);
   }
@@ -331,7 +328,10 @@ export class TerminalSessionController {
     }
   }
 
-  killTerminalForClose(terminalId: string): { terminalId: string; success: boolean } {
+  killTerminalForClose(terminalId: string): {
+    terminalId: string;
+    success: boolean;
+  } {
     if (!this.terminalManager) {
       return { terminalId, success: false };
     }
@@ -350,12 +350,13 @@ export class TerminalSessionController {
     );
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     if (this.unsubscribeTerminalsChanged) {
       this.unsubscribeTerminalsChanged();
       this.unsubscribeTerminalsChanged = null;
     }
     this.subscribedDirectories.clear();
+    this.terminalAdmissionGenerations.clear();
 
     for (const unsubscribeExit of this.exitSubscriptions.values()) {
       unsubscribeExit();
@@ -365,23 +366,38 @@ export class TerminalSessionController {
     for (const terminalId of Array.from(this.idToSlot.keys())) {
       this.detachStream(terminalId, { emitExit: false });
     }
+    const releases: Promise<void>[] = [];
     for (const authority of this.restrictedTerminalAuthorities.values()) {
-      void authority.release();
+      releases.push(authority.release());
     }
     this.restrictedTerminalAuthorities.clear();
     for (const authority of this.restrictedDirectoryAuthorities.values()) {
-      void authority.release();
+      releases.push(authority.release());
     }
     this.restrictedDirectoryAuthorities.clear();
+    await Promise.all(releases);
   }
 
   private async replaceRestrictedDirectoryAuthority(
     key: string,
     authority: MayaRestrictedWorkspaceAuthority,
+    subscription: {
+      cwd: string;
+      workspaceId: string | undefined;
+      generation: number;
+    },
   ): Promise<void> {
     const previous = this.restrictedDirectoryAuthorities.get(key);
-    this.restrictedDirectoryAuthorities.set(key, authority.retain());
+    const retained = authority.retain();
+    if (this.restrictedDirectoryAuthorities.get(key) === previous) {
+      this.restrictedDirectoryAuthorities.delete(key);
+    }
     await previous?.release();
+    if (this.subscribedDirectories.get(key) !== subscription) {
+      await retained.release();
+      return;
+    }
+    this.restrictedDirectoryAuthorities.set(key, retained);
   }
 
   private async releaseRestrictedDirectoryAuthority(key: string): Promise<void> {
@@ -423,23 +439,7 @@ export class TerminalSessionController {
   }
 
   private async ensureRestrictedTerminalAuthority(terminal: TerminalSession): Promise<boolean> {
-    if (await this.validateRestrictedTerminalAuthority(terminal)) return true;
-    const acquire = this.acquireMayaRestrictedWorkspaceAuthority;
-    if (!acquire) return false;
-    let authority: MayaRestrictedWorkspaceAuthority | null = null;
-    try {
-      authority = await acquire(terminal.cwd, terminal.workspaceId);
-      await this.bindRestrictedTerminalAuthority(terminal, authority);
-      return true;
-    } catch (error) {
-      this.sessionLogger.warn(
-        { err: error, terminalId: terminal.id },
-        "Rejected terminal with stale Maya workspace authority",
-      );
-      return false;
-    } finally {
-      await authority?.release();
-    }
+    return this.validateRestrictedTerminalAuthority(terminal);
   }
 
   private async terminateRestrictedTerminalAndWait(
@@ -557,14 +557,15 @@ export class TerminalSessionController {
     };
     this.nextDirectoryGeneration += 1;
     const key = terminalSubscriptionKey(msg.cwd, msg.workspaceId);
+    this.subscribedDirectories.set(key, subscription);
     if (options.mayaRestrictedMode) {
       const authority = options.workspaceAuthority;
       if (!authority || msg.workspaceId !== authority.workspaceId || msg.cwd !== authority.cwd) {
         throw new Error("terminal directory subscription lacks selected workspace authority");
       }
-      await this.replaceRestrictedDirectoryAuthority(key, authority);
+      await this.replaceRestrictedDirectoryAuthority(key, authority, subscription);
+      if (this.subscribedDirectories.get(key) !== subscription) return;
     }
-    this.subscribedDirectories.set(key, subscription);
     await this.emitTerminalsSnapshotForSubscription(subscription);
   }
 
@@ -742,7 +743,9 @@ export class TerminalSessionController {
       return [];
     }
 
-    const terminals = await this.terminalManager.getTerminals(cwd, { workspaceId });
+    const terminals = await this.terminalManager.getTerminals(cwd, {
+      workspaceId,
+    });
     const workspaceRoots = await this.listTerminalWorkspaceRoots();
     if (workspaceRoots.length === 0) {
       return terminals;
@@ -952,19 +955,18 @@ export class TerminalSessionController {
       return;
     }
 
-    const session = this.terminalManager.getTerminal(msg.terminalId);
-    if (
-      mayaRestrictedMode &&
-      (!session || !(await this.ensureRestrictedTerminalAuthority(session)))
-    ) {
-      const error = session
-        ? await this.terminateRestrictedTerminalAndWait(
-            session,
-            "Terminal workspace authority is unavailable",
-          )
-        : "Terminal not found";
-      respond(false, error);
-      return;
+    if (mayaRestrictedMode) {
+      const session = this.terminalManager.getTerminal(msg.terminalId);
+      if (!session || !(await this.ensureRestrictedTerminalAuthority(session))) {
+        const error = session
+          ? await this.terminateRestrictedTerminalAndWait(
+              session,
+              "Terminal workspace authority is unavailable",
+            )
+          : "Terminal not found";
+        respond(false, error);
+        return;
+      }
     }
 
     const renamed = this.terminalManager.setTerminalTitle(msg.terminalId, title);
@@ -975,6 +977,9 @@ export class TerminalSessionController {
     msg: SubscribeTerminalRequest,
     mayaRestrictedMode: boolean,
   ): Promise<void> {
+    const admissionGeneration = this.nextTerminalAdmissionGeneration;
+    this.nextTerminalAdmissionGeneration += 1;
+    this.terminalAdmissionGenerations.set(msg.terminalId, admissionGeneration);
     if (!this.terminalManager) {
       this.emit({
         type: "subscribe_terminal_response",
@@ -1014,6 +1019,7 @@ export class TerminalSessionController {
       });
       return;
     }
+    if (this.terminalAdmissionGenerations.get(msg.terminalId) !== admissionGeneration) return;
     this.ensureExitSubscription(session);
 
     if (msg.restore?.size) {
@@ -1024,6 +1030,10 @@ export class TerminalSessionController {
     }
 
     const slot = this.bindActiveStream(session, { restore: msg.restore });
+    if (this.terminalAdmissionGenerations.get(msg.terminalId) !== admissionGeneration) {
+      this.detachStream(msg.terminalId, { emitExit: false });
+      return;
+    }
     if (slot === null) {
       this.sessionLogger.warn(
         {
@@ -1060,6 +1070,8 @@ export class TerminalSessionController {
   }
 
   private handleUnsubscribeTerminalRequest(msg: UnsubscribeTerminalRequest): void {
+    this.terminalAdmissionGenerations.set(msg.terminalId, this.nextTerminalAdmissionGeneration);
+    this.nextTerminalAdmissionGeneration += 1;
     this.detachStream(msg.terminalId, { emitExit: false });
   }
 
@@ -1254,6 +1266,8 @@ export class TerminalSessionController {
       bufferedOutputs: [],
       outputBytesSinceSnapshot: 0,
       restrictedEmissionTail: Promise.resolve(),
+      restrictedPendingOutputFrames: 0,
+      restrictedPendingOutputBytes: 0,
       outputCoalescer: new TerminalOutputCoalescer({
         timers: { setTimeout, clearTimeout },
         onFlush: ({ payload }) => {
@@ -1287,6 +1301,19 @@ export class TerminalSessionController {
             payload,
           });
           if (this.restrictedTerminalAuthorities.has(terminal.id)) {
+            if (
+              activeStream.restrictedPendingOutputFrames >= MAX_RESTRICTED_PENDING_OUTPUT_FRAMES ||
+              activeStream.restrictedPendingOutputBytes + encoded.byteLength >
+                MAX_RESTRICTED_PENDING_OUTPUT_BYTES
+            ) {
+              void this.terminateRestrictedTerminalAndWait(
+                terminal,
+                "Terminal output authority queue exceeded its bound",
+              );
+              return;
+            }
+            activeStream.restrictedPendingOutputFrames += 1;
+            activeStream.restrictedPendingOutputBytes += encoded.byteLength;
             activeStream.restrictedEmissionTail = activeStream.restrictedEmissionTail
               .then(async () => {
                 if (
@@ -1314,6 +1341,10 @@ export class TerminalSessionController {
                     "Terminal workspace authority is unavailable",
                   );
                 }
+              })
+              .finally(() => {
+                activeStream.restrictedPendingOutputFrames -= 1;
+                activeStream.restrictedPendingOutputBytes -= encoded.byteLength;
               });
             return;
           }
@@ -1353,7 +1384,9 @@ export class TerminalSessionController {
         }
         activeStream.outputCoalescer.handle(message.data);
       },
-      { initialSnapshot: resolveTerminalSubscriptionSnapshotMode(options?.restore) },
+      {
+        initialSnapshot: resolveTerminalSubscriptionSnapshotMode(options?.restore),
+      },
     );
     return slot;
   }

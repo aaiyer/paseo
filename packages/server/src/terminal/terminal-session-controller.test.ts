@@ -78,7 +78,10 @@ describe("terminal-session-controller restore", () => {
       onActivityChange: () => vi.fn(),
       getSize: () => ({ rows: 1, cols: 80 }),
       getState: () => terminalState("restore-before"),
-      getStateSnapshot: () => ({ state: terminalState("restore-before"), revision: 1 }),
+      getStateSnapshot: () => ({
+        state: terminalState("restore-before"),
+        revision: 1,
+      }),
       getReplayPreamble: () => "\x1b[?1h\x1b[?2004h",
       getTitle: () => undefined,
       getActivity: () => null,
@@ -132,7 +135,11 @@ describe("terminal-session-controller restore", () => {
     await Promise.resolve();
     expect(terminalManager.getTerminalState).toHaveBeenCalledTimes(1);
 
-    terminalListener?.({ type: "output", data: "restore-after\n", revision: 2 });
+    terminalListener?.({
+      type: "output",
+      data: "restore-after\n",
+      revision: 2,
+    });
     snapshot.resolve({ state: terminalState("restore-before"), revision: 1 });
     await snapshot.promise;
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -209,7 +216,12 @@ describe("terminal-session-controller legacy terminal creation", () => {
   test("kills and awaits a spawned terminal when workspace identity drifts during creation", async () => {
     const cwd = "/work/repo";
     const workspaceId = "ws-bound";
-    const terminal = listSession({ id: "term-drift", name: "Shell", cwd, workspaceId });
+    const terminal = listSession({
+      id: "term-drift",
+      name: "Shell",
+      cwd,
+      workspaceId,
+    });
     let current = true;
     const killTerminalAndWait = vi.fn();
     const createTerminal = vi.fn(async () => {
@@ -247,7 +259,12 @@ describe("terminal-session-controller legacy terminal creation", () => {
     });
 
     await controller.dispatch(
-      { type: "create_terminal_request", cwd, workspaceId, requestId: "create" },
+      {
+        type: "create_terminal_request",
+        cwd,
+        workspaceId,
+        requestId: "create",
+      },
       { mayaRestrictedMode: true, workspaceAuthority: authority },
     );
 
@@ -267,8 +284,18 @@ describe("terminal-session-controller legacy terminal creation", () => {
     const cwd = "/work/repo";
     const authorityCheck = deferred<boolean>();
     let authorityChecks = 0;
-    const first = listSession({ id: "term-first", name: "First", cwd, workspaceId: "ws" });
-    const second = listSession({ id: "term-second", name: "Second", cwd, workspaceId: "ws" });
+    const first = listSession({
+      id: "term-first",
+      name: "First",
+      cwd,
+      workspaceId: "ws",
+    });
+    const second = listSession({
+      id: "term-second",
+      name: "Second",
+      cwd,
+      workspaceId: "ws",
+    });
     const terminals = new Map([
       [first.id, first],
       [second.id, second],
@@ -276,7 +303,10 @@ describe("terminal-session-controller legacy terminal creation", () => {
     const manager = {
       createTerminal: vi.fn(async () => first),
       getTerminal: vi.fn((id: string) => terminals.get(id)),
-      getTerminalState: vi.fn(async () => ({ state: terminalState(""), revision: 0 })),
+      getTerminalState: vi.fn(async () => ({
+        state: terminalState(""),
+        revision: 0,
+      })),
       killTerminalAndWait: vi.fn(),
     } as unknown as TerminalManager;
     const authority: MayaRestrictedWorkspaceAuthority = {
@@ -306,7 +336,12 @@ describe("terminal-session-controller legacy terminal creation", () => {
       sessionLogger: createLogger(),
     });
     await controller.dispatch(
-      { type: "create_terminal_request", cwd, workspaceId: "ws", requestId: "create" },
+      {
+        type: "create_terminal_request",
+        cwd,
+        workspaceId: "ws",
+        requestId: "create",
+      },
       { mayaRestrictedMode: true, workspaceAuthority: authority },
     );
     await controller.dispatch({
@@ -346,7 +381,12 @@ describe("terminal-session-controller legacy terminal creation", () => {
   test("retains exact workspace authority for terminal input and kills on identity drift", async () => {
     const cwd = "/work/repo";
     const workspaceId = "ws-bound";
-    const terminal = listSession({ id: "term-bound", name: "Shell", cwd, workspaceId });
+    const terminal = listSession({
+      id: "term-bound",
+      name: "Shell",
+      cwd,
+      workspaceId,
+    });
     const send = vi.spyOn(terminal, "send");
     const killTerminalAndWait = vi.fn();
     const terminalManager = {
@@ -397,11 +437,15 @@ describe("terminal-session-controller legacy terminal creation", () => {
       isPathWithinRoot: isSameOrDescendantPath,
       sessionLogger: logger,
       listTerminalWorkspaceRefs: async () => [{ workspaceId, cwd }],
-      acquireMayaRestrictedWorkspaceAuthority: async () => authority.retain(),
     });
 
     await controller.dispatch(
-      { type: "create_terminal_request", cwd, workspaceId, requestId: "create" },
+      {
+        type: "create_terminal_request",
+        cwd,
+        workspaceId,
+        requestId: "create",
+      },
       { mayaRestrictedMode: true, workspaceAuthority: authority },
     );
     expect(terminalManager.createTerminal).toHaveBeenCalledWith(
@@ -476,11 +520,19 @@ describe("terminal-session-controller legacy terminal creation", () => {
 
   test("serializes restricted binary validation and PTY input in FIFO order", async () => {
     const cwd = "/work/repo";
-    const terminal = listSession({ id: "term-ordered", name: "Shell", cwd, workspaceId: "ws" });
+    const terminal = listSession({
+      id: "term-ordered",
+      name: "Shell",
+      cwd,
+      workspaceId: "ws",
+    });
     const manager = {
       createTerminal: vi.fn(async () => terminal),
       getTerminal: vi.fn(() => terminal),
-      getTerminalState: vi.fn(async () => ({ state: terminalState(""), revision: 0 })),
+      getTerminalState: vi.fn(async () => ({
+        state: terminalState(""),
+        revision: 0,
+      })),
       killTerminalAndWait: vi.fn(),
     } as unknown as TerminalManager;
     let validationCount = 0;
@@ -492,7 +544,11 @@ describe("terminal-session-controller legacy terminal creation", () => {
       cwd,
       workspaceId: "ws",
       rootAccessPath: "/proc/self/fd/7",
-      terminalSandboxBinding: async () => ({ workspaceRoot: cwd, rootDevice: 1n, rootInode: 2n }),
+      terminalSandboxBinding: async () => ({
+        workspaceRoot: cwd,
+        rootDevice: 1n,
+        rootInode: 2n,
+      }),
       retain() {
         return this;
       },
@@ -521,7 +577,12 @@ describe("terminal-session-controller legacy terminal creation", () => {
       sessionLogger: createLogger(),
     });
     await controller.dispatch(
-      { type: "create_terminal_request", cwd, workspaceId: "ws", requestId: "create" },
+      {
+        type: "create_terminal_request",
+        cwd,
+        workspaceId: "ws",
+        requestId: "create",
+      },
       { mayaRestrictedMode: true, workspaceAuthority: authority },
     );
     await controller.dispatch({
@@ -531,7 +592,9 @@ describe("terminal-session-controller legacy terminal creation", () => {
     });
     await vi.waitFor(() => expect(emitBinary).toHaveBeenCalled());
     measureBinaryValidations = true;
-    const internals = controller as unknown as { activeStreams: Map<number, unknown> };
+    const internals = controller as unknown as {
+      activeStreams: Map<number, unknown>;
+    };
     const slot = [...internals.activeStreams.keys()][0]!;
     const sends = ["one", "two", "three"].map((text) =>
       controller.handleBinaryFrame(
@@ -560,14 +623,23 @@ describe("terminal-session-controller legacy terminal creation", () => {
 
   test("bounds a restricted binary burst and terminates before queued input can pass", async () => {
     const cwd = "/work/repo";
-    const terminal = listSession({ id: "term-bounded", name: "Shell", cwd, workspaceId: "ws" });
+    const terminal = listSession({
+      id: "term-bounded",
+      name: "Shell",
+      cwd,
+      workspaceId: "ws",
+    });
     const validation = deferred<boolean>();
     let admitted = true;
     const authority: MayaRestrictedWorkspaceAuthority = {
       cwd,
       workspaceId: "ws",
       rootAccessPath: "/proc/self/fd/7",
-      terminalSandboxBinding: async () => ({ workspaceRoot: cwd, rootDevice: 1n, rootInode: 2n }),
+      terminalSandboxBinding: async () => ({
+        workspaceRoot: cwd,
+        rootDevice: 1n,
+        rootInode: 2n,
+      }),
       retain() {
         return this;
       },
@@ -578,7 +650,10 @@ describe("terminal-session-controller legacy terminal creation", () => {
     const manager = {
       createTerminal: vi.fn(async () => terminal),
       getTerminal: vi.fn(() => terminal),
-      getTerminalState: vi.fn(async () => ({ state: terminalState(""), revision: 0 })),
+      getTerminalState: vi.fn(async () => ({
+        state: terminalState(""),
+        revision: 0,
+      })),
       killTerminalAndWait,
     } as unknown as TerminalManager;
     const logger = createLogger();
@@ -592,7 +667,12 @@ describe("terminal-session-controller legacy terminal creation", () => {
       sessionLogger: logger,
     });
     await controller.dispatch(
-      { type: "create_terminal_request", cwd, workspaceId: "ws", requestId: "create" },
+      {
+        type: "create_terminal_request",
+        cwd,
+        workspaceId: "ws",
+        requestId: "create",
+      },
       { mayaRestrictedMode: true, workspaceAuthority: authority },
     );
     await controller.dispatch({
@@ -602,7 +682,9 @@ describe("terminal-session-controller legacy terminal creation", () => {
     });
     await vi.waitFor(() => expect(emitBinary).toHaveBeenCalled());
     admitted = false;
-    const internals = controller as unknown as { activeStreams: Map<number, unknown> };
+    const internals = controller as unknown as {
+      activeStreams: Map<number, unknown>;
+    };
     const slot = [...internals.activeStreams.keys()][0]!;
     const burst = Array.from({ length: 65 }, (_, index) =>
       controller.handleBinaryFrame(
@@ -625,6 +707,163 @@ describe("terminal-session-controller legacy terminal creation", () => {
         reason: "Terminal input authority queue exceeded its bound",
       }),
       "Maya restricted terminal authority drifted; terminating terminal",
+    );
+  });
+
+  test("does not attach an individual stream when unsubscribe supersedes deferred admission", async () => {
+    const cwd = "/work/repo";
+    const terminal = listSession({
+      id: "term-admission",
+      name: "Shell",
+      cwd,
+      workspaceId: "ws",
+    });
+    terminal.subscribe = vi.fn(() => vi.fn());
+    const admissionStarted = deferred<void>();
+    const finishAdmission = deferred<boolean>();
+    let authorityChecks = 0;
+    const authority: MayaRestrictedWorkspaceAuthority = {
+      ...fakeTerminalAuthority(cwd, "ws"),
+      retain() {
+        return authority;
+      },
+      isCurrent: async () => {
+        authorityChecks += 1;
+        if (authorityChecks === 1) return true;
+        admissionStarted.resolve();
+        return finishAdmission.promise;
+      },
+    };
+    const manager = {
+      createTerminal: vi.fn(async () => terminal),
+      getTerminal: vi.fn(() => terminal),
+      getTerminalState: vi.fn(async () => ({
+        state: terminalState(""),
+        revision: 0,
+      })),
+      killTerminalAndWait: vi.fn(),
+    } as unknown as TerminalManager;
+    const emitted: SessionOutboundMessage[] = [];
+    const controller = new TerminalSessionController({
+      terminalManager: manager,
+      emit: (message) => emitted.push(message),
+      emitBinary: vi.fn(),
+      hasBinaryChannel: () => true,
+      isPathWithinRoot: isSameOrDescendantPath,
+      sessionLogger: createLogger(),
+    });
+    await controller.dispatch(
+      {
+        type: "create_terminal_request",
+        cwd,
+        workspaceId: "ws",
+        requestId: "create",
+      },
+      { mayaRestrictedMode: true, workspaceAuthority: authority },
+    );
+    const subscribe = controller.dispatch(
+      {
+        type: "subscribe_terminal_request",
+        terminalId: terminal.id,
+        requestId: "subscribe",
+      },
+      { mayaRestrictedMode: true },
+    );
+    await admissionStarted.promise;
+    controller.dispatch({
+      type: "unsubscribe_terminal_request",
+      terminalId: terminal.id,
+    });
+    finishAdmission.resolve(true);
+    await subscribe;
+
+    expect(terminal.subscribe).not.toHaveBeenCalled();
+    expect(
+      emitted.some(
+        (message) =>
+          message.type === "subscribe_terminal_response" &&
+          message.payload.requestId === "subscribe",
+      ),
+    ).toBe(false);
+    expect(controller.getMetrics().streamSubscriptionCount).toBe(0);
+  });
+
+  test("bounds restricted PTY output awaiting authority validation", async () => {
+    const cwd = "/work/repo";
+    let listener: ((message: ServerMessage) => void) | undefined;
+    const terminal = {
+      ...listSession({
+        id: "term-output-bound",
+        name: "Shell",
+        cwd,
+        workspaceId: "ws",
+      }),
+      subscribe: vi.fn((next: (message: ServerMessage) => void) => {
+        listener = next;
+        queueMicrotask(() => next({ type: "snapshotReady", revision: 0 }));
+        return vi.fn();
+      }),
+    };
+    const blockedValidation = deferred<boolean>();
+    let block = false;
+    const authority: MayaRestrictedWorkspaceAuthority = {
+      ...fakeTerminalAuthority(cwd, "ws"),
+      isCurrent: async () => (block ? blockedValidation.promise : true),
+    };
+    const killTerminalAndWait = vi.fn(async () => undefined);
+    const manager = {
+      createTerminal: vi.fn(async () => terminal),
+      getTerminal: vi.fn(() => terminal),
+      getTerminalState: vi.fn(async () => ({
+        state: terminalState(""),
+        revision: 0,
+      })),
+      killTerminalAndWait,
+    } as unknown as TerminalManager;
+    const emitBinary = vi.fn();
+    const logger = createLogger();
+    const controller = new TerminalSessionController({
+      terminalManager: manager,
+      emit: vi.fn(),
+      emitBinary,
+      hasBinaryChannel: () => true,
+      isPathWithinRoot: isSameOrDescendantPath,
+      sessionLogger: logger,
+    });
+    await controller.dispatch(
+      {
+        type: "create_terminal_request",
+        cwd,
+        workspaceId: "ws",
+        requestId: "create",
+      },
+      { mayaRestrictedMode: true, workspaceAuthority: authority },
+    );
+    await controller.dispatch({
+      type: "subscribe_terminal_request",
+      terminalId: terminal.id,
+      requestId: "subscribe",
+    });
+    await vi.waitFor(() => expect(emitBinary).toHaveBeenCalled());
+    const internals = controller as unknown as {
+      activeStreams: Map<number, { outputCoalescer: { flush(): void } }>;
+    };
+    const activeStream = [...internals.activeStreams.values()][0]!;
+    block = true;
+    for (let index = 0; index < 65; index += 1) {
+      listener?.({ type: "output", data: String(index), revision: index + 1 });
+      activeStream.outputCoalescer.flush();
+    }
+    await vi.waitFor(() => expect(killTerminalAndWait).toHaveBeenCalledWith(terminal.id));
+    blockedValidation.resolve(true);
+    await vi.waitFor(() =>
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: MAYA_RESTRICTED_TERMINAL_AUTHORITY_DIAGNOSTIC,
+          reason: "Terminal output authority queue exceeded its bound",
+        }),
+        "Maya restricted terminal authority drifted; terminating terminal",
+      ),
     );
   });
 
@@ -755,7 +994,12 @@ describe("terminal-session-controller legacy terminal creation", () => {
     });
 
     expect(createTerminal).toHaveBeenCalledWith(
-      expect.objectContaining({ cwd: "/work/repo", workspaceId: "ws-1", rows: 55, cols: 136 }),
+      expect.objectContaining({
+        cwd: "/work/repo",
+        workspaceId: "ws-1",
+        rows: 55,
+        cols: 136,
+      }),
     );
   });
 });
@@ -802,7 +1046,10 @@ describe("terminal-session-controller wrap-flag gating", () => {
       killAndWait: vi.fn(),
     };
     const getTerminalState = vi.fn(() =>
-      Promise.resolve<TerminalStateSnapshot>({ state: terminalState("hello"), revision: 1 }),
+      Promise.resolve<TerminalStateSnapshot>({
+        state: terminalState("hello"),
+        revision: 1,
+      }),
     );
     const terminalManager = {
       getTerminals: vi.fn(),
@@ -888,22 +1135,84 @@ describe("terminal-session-controller subdirectory aggregation", () => {
       isPathWithinRoot: isSameOrDescendantPath,
       sessionLogger: createLogger(),
     });
-    const request = { type: "subscribe_terminals_request" as const, cwd, workspaceId: "ws" };
+    const request = {
+      type: "subscribe_terminals_request" as const,
+      cwd,
+      workspaceId: "ws",
+    };
     const firstSubscription = controller.dispatch(request, {
       mayaRestrictedMode: true,
       workspaceAuthority: authority,
     });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(terminalManager.getTerminals).toHaveBeenCalledTimes(1));
     const secondSubscription = controller.dispatch(request, {
       mayaRestrictedMode: true,
       workspaceAuthority: authority,
     });
+    await vi.waitFor(() => expect(terminalManager.getTerminals).toHaveBeenCalledTimes(2));
     second.resolve([]);
     await secondSubscription;
     first.resolve([]);
     await firstSubscription;
 
     expect(emitted).toEqual([{ type: "terminals_changed", payload: { cwd, terminals: [] } }]);
+  });
+
+  test("does not install or double-release directory authority after deferred replacement cancellation", async () => {
+    const cwd = "/work/repo";
+    const firstRelease = deferred<void>();
+    const secondRelease = vi.fn(async () => undefined);
+    const firstRetained = {
+      ...fakeTerminalAuthority(cwd, "ws"),
+      release: vi.fn(() => firstRelease.promise),
+    };
+    const secondRetained = {
+      ...fakeTerminalAuthority(cwd, "ws"),
+      release: secondRelease,
+    };
+    const retained = [firstRetained, secondRetained];
+    const authority = {
+      ...fakeTerminalAuthority(cwd, "ws"),
+      retain: vi.fn(() => retained.shift()!),
+    };
+    const terminalManager = {
+      getTerminals: vi.fn(async () => []),
+      subscribeTerminalsChanged: vi.fn(() => vi.fn()),
+      listDirectories: vi.fn(() => [cwd]),
+    } as unknown as TerminalManager;
+    const controller = new TerminalSessionController({
+      terminalManager,
+      emit: vi.fn(),
+      emitBinary: vi.fn(),
+      hasBinaryChannel: () => true,
+      isPathWithinRoot: isSameOrDescendantPath,
+      sessionLogger: createLogger(),
+    });
+    const request = {
+      type: "subscribe_terminals_request" as const,
+      cwd,
+      workspaceId: "ws",
+    };
+    await controller.dispatch(request, {
+      mayaRestrictedMode: true,
+      workspaceAuthority: authority,
+    });
+    const replacement = controller.dispatch(request, {
+      mayaRestrictedMode: true,
+      workspaceAuthority: authority,
+    });
+    await vi.waitFor(() => expect(firstRetained.release).toHaveBeenCalledTimes(1));
+    await controller.dispatch(
+      { type: "unsubscribe_terminals_request", cwd, workspaceId: "ws" },
+      { mayaRestrictedMode: true, workspaceAuthority: authority },
+    );
+    firstRelease.resolve();
+    await replacement;
+
+    expect(secondRelease).toHaveBeenCalledTimes(1);
+    expect(controller.getMetrics().directorySubscriptionCount).toBe(0);
+    await controller.dispose();
+    expect(secondRelease).toHaveBeenCalledTimes(1);
   });
 
   test("delivers a subdirectory change to a root subscriber as an aggregated, root-keyed snapshot", async () => {
@@ -958,7 +1267,14 @@ describe("terminal-session-controller subdirectory aggregation", () => {
 
     changedListener?.({
       cwd: subdirCwd,
-      terminals: [{ id: "subdir-term", name: "Mobile", cwd: subdirCwd, workspaceId: "ws-test" }],
+      terminals: [
+        {
+          id: "subdir-term",
+          name: "Mobile",
+          cwd: subdirCwd,
+          workspaceId: "ws-test",
+        },
+      ],
     });
     await flushMicrotasks();
 
@@ -968,8 +1284,18 @@ describe("terminal-session-controller subdirectory aggregation", () => {
         payload: {
           cwd: rootCwd,
           terminals: [
-            { id: "root-term", name: "Terminal 1", workspaceId: "ws-test", activity: null },
-            { id: "subdir-term", name: "Mobile", workspaceId: "ws-test", activity: null },
+            {
+              id: "root-term",
+              name: "Terminal 1",
+              workspaceId: "ws-test",
+              activity: null,
+            },
+            {
+              id: "subdir-term",
+              name: "Mobile",
+              workspaceId: "ws-test",
+              activity: null,
+            },
           ],
         },
       },
@@ -979,7 +1305,11 @@ describe("terminal-session-controller subdirectory aggregation", () => {
   test("keeps nested workspace terminals out of the parent workspace terminal list", async () => {
     const rootCwd = "/work/repo";
     const worktreeCwd = "/work/repo/.dev/paseo-home/worktrees/hash/feature-a";
-    const rootTerminal = listSession({ id: "root-term", name: "Terminal 1", cwd: rootCwd });
+    const rootTerminal = listSession({
+      id: "root-term",
+      name: "Terminal 1",
+      cwd: rootCwd,
+    });
     const worktreeTerminal = listSession({
       id: "worktree-term",
       name: "Feature",
@@ -1033,7 +1363,12 @@ describe("terminal-session-controller subdirectory aggregation", () => {
         payload: {
           cwd: rootCwd,
           terminals: [
-            { id: "root-term", name: "Terminal 1", workspaceId: "ws-test", activity: null },
+            {
+              id: "root-term",
+              name: "Terminal 1",
+              workspaceId: "ws-test",
+              activity: null,
+            },
           ],
           requestId: "req-root",
         },
@@ -1043,7 +1378,12 @@ describe("terminal-session-controller subdirectory aggregation", () => {
         payload: {
           cwd: worktreeCwd,
           terminals: [
-            { id: "worktree-term", name: "Feature", workspaceId: "ws-test", activity: null },
+            {
+              id: "worktree-term",
+              name: "Feature",
+              workspaceId: "ws-test",
+              activity: null,
+            },
           ],
           requestId: "req-worktree",
         },
@@ -1100,15 +1440,30 @@ describe("terminal-session-controller workspace-scoped subscriptions", () => {
     });
     controller.start();
 
-    controller.dispatch({ type: "subscribe_terminals_request", cwd, workspaceId: "ws-a" });
-    controller.dispatch({ type: "subscribe_terminals_request", cwd, workspaceId: "ws-b" });
+    controller.dispatch({
+      type: "subscribe_terminals_request",
+      cwd,
+      workspaceId: "ws-a",
+    });
+    controller.dispatch({
+      type: "subscribe_terminals_request",
+      cwd,
+      workspaceId: "ws-b",
+    });
     await flushMicrotasks();
     outboundMessages.length = 0;
 
     // Tearing down workspace B must not drop workspace A's live subscription.
-    controller.dispatch({ type: "unsubscribe_terminals_request", cwd, workspaceId: "ws-b" });
+    controller.dispatch({
+      type: "unsubscribe_terminals_request",
+      cwd,
+      workspaceId: "ws-b",
+    });
 
-    changedListener?.({ cwd, terminals: [{ id: "a", name: "A", cwd, workspaceId: "ws-a" }] });
+    changedListener?.({
+      cwd,
+      terminals: [{ id: "a", name: "A", cwd, workspaceId: "ws-a" }],
+    });
     await flushMicrotasks();
 
     expect(outboundMessages).toEqual([
@@ -1140,7 +1495,11 @@ describe("terminal-session-controller backpressure snapshot fallback", () => {
         // Legacy stream: a snapshot arrives on subscribe (one Snapshot frame),
         // after which output streams through the coalescer as Output frames.
         queueMicrotask(() =>
-          listener({ type: "snapshot", state: terminalState("live"), revision: 1 }),
+          listener({
+            type: "snapshot",
+            state: terminalState("live"),
+            revision: 1,
+          }),
         );
         return vi.fn();
       },
@@ -1163,7 +1522,10 @@ describe("terminal-session-controller backpressure snapshot fallback", () => {
       registerCwdEnv: vi.fn(),
       getTerminal: vi.fn(() => terminal),
       getTerminalState: vi.fn(() =>
-        Promise.resolve<TerminalStateSnapshot>({ state: terminalState("live"), revision: 1 }),
+        Promise.resolve<TerminalStateSnapshot>({
+          state: terminalState("live"),
+          revision: 1,
+        }),
       ),
       setTerminalTitle: vi.fn(),
       killTerminal: vi.fn(),

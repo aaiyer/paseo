@@ -95,6 +95,20 @@ export function createWorkspaceGitObserverService(deps: {
     }
   >();
   let nextSubscriptionGeneration = 1;
+  const workspaceSyncGenerations = new Map<string, number>();
+  let nextWorkspaceSyncGeneration = 1;
+  let disposed = false;
+
+  function reserveWorkspaceSync(workspaceId: string): number {
+    const generation = nextWorkspaceSyncGeneration;
+    nextWorkspaceSyncGeneration += 1;
+    workspaceSyncGenerations.set(workspaceId, generation);
+    return generation;
+  }
+
+  function workspaceSyncIsCurrent(workspaceId: string, generation: number): boolean {
+    return !disposed && workspaceSyncGenerations.get(workspaceId) === generation;
+  }
 
   function descriptorStateKey(workspace: WorkspaceDescriptorPayload | null): string {
     if (!workspace) {
@@ -141,7 +155,20 @@ export function createWorkspaceGitObserverService(deps: {
     }
   }
 
+  function removeSubscriptionIfCurrent(
+    cwd: string,
+    expected: {
+      unsubscribe: () => void;
+      authority: MayaRestrictedWorkspaceAuthority | null;
+      generation: number;
+    },
+  ): void {
+    if (subscriptions.get(cwd) !== expected) return;
+    removeForCwd(cwd);
+  }
+
   function removeForWorkspaceId(workspaceId: string): void {
+    reserveWorkspaceSync(workspaceId);
     const state = workspaceStates.get(workspaceId);
     if (!state) {
       return;
@@ -247,9 +274,11 @@ export function createWorkspaceGitObserverService(deps: {
     },
   ): Promise<void> {
     const authority = subscription.authority;
-    if (!authority || subscriptions.get(cwd) !== subscription) return;
-    if (!(await authority.isCurrent())) {
-      removeForCwd(cwd);
+    if (!authority || disposed || subscriptions.get(cwd) !== subscription) return;
+    const currentBeforeUpdate = await authority.isCurrent();
+    if (disposed || subscriptions.get(cwd) !== subscription) return;
+    if (!currentBeforeUpdate) {
+      removeSubscriptionIfCurrent(cwd, subscription);
       return;
     }
     try {
@@ -257,12 +286,11 @@ export function createWorkspaceGitObserverService(deps: {
     } catch (error) {
       logger.warn({ err: error, cwd }, "Failed to emit workspace update after git branch snapshot");
     }
-    if (
-      subscriptions.get(cwd) !== subscription ||
-      !(await authority.isCurrent()) ||
-      subscriptions.get(cwd)?.generation !== subscription.generation
-    ) {
-      removeForCwd(cwd);
+    if (disposed || subscriptions.get(cwd) !== subscription) return;
+    const currentAfterUpdate = await authority.isCurrent();
+    if (disposed || subscriptions.get(cwd) !== subscription) return;
+    if (!currentAfterUpdate || subscriptions.get(cwd)?.generation !== subscription.generation) {
+      removeSubscriptionIfCurrent(cwd, subscription);
       return;
     }
     handleBranchSnapshot(cwd, snapshot.git.currentBranch ?? null);
@@ -271,6 +299,7 @@ export function createWorkspaceGitObserverService(deps: {
 
   function syncObservers(workspaces: Iterable<WorkspaceDescriptorPayload>): void {
     for (const workspace of workspaces) {
+      reserveWorkspaceSync(workspace.id);
       syncObserver(workspace.workspaceDirectory, {
         isGit: workspace.workspaceKind !== "directory",
         workspaceId: workspace.id,
@@ -283,6 +312,8 @@ export function createWorkspaceGitObserverService(deps: {
     workspaces: Iterable<WorkspaceDescriptorPayload>,
   ): Promise<void> {
     for (const workspace of workspaces) {
+      if (disposed) return;
+      const syncGeneration = reserveWorkspaceSync(workspace.id);
       try {
         const isGit = workspace.workspaceKind !== "directory";
         const cwd = resolve(workspace.workspaceDirectory);
@@ -296,8 +327,18 @@ export function createWorkspaceGitObserverService(deps: {
         if (existingSubscription && !existingSubscription.authority) removeForCwd(cwd);
         const existing = subscriptions.get(cwd)?.authority;
         if (existing) {
-          if (existing.workspaceId !== workspace.id || !(await existing.isCurrent())) {
-            removeForCwd(cwd);
+          const expectedSubscription = subscriptions.get(cwd);
+          const existingIsCurrent = await existing.isCurrent();
+          if (
+            !workspaceSyncIsCurrent(workspace.id, syncGeneration) ||
+            subscriptions.get(cwd) !== expectedSubscription
+          ) {
+            continue;
+          }
+          if (existing.workspaceId !== workspace.id || !existingIsCurrent) {
+            if (expectedSubscription) {
+              removeSubscriptionIfCurrent(cwd, expectedSubscription);
+            }
             throw new Error("workspace observer authority no longer matches the catalog");
           }
           syncObserver(cwd, { isGit, workspaceId: workspace.id });
@@ -306,6 +347,10 @@ export function createWorkspaceGitObserverService(deps: {
         }
 
         const authority = await openRestrictedAuthority(cwd);
+        if (!workspaceSyncIsCurrent(workspace.id, syncGeneration)) {
+          await authority.release();
+          continue;
+        }
         if (authority.workspaceId !== workspace.id) {
           await authority.release();
           throw new Error("workspace observer authority does not match the catalog");
@@ -313,9 +358,14 @@ export function createWorkspaceGitObserverService(deps: {
         syncObserver(cwd, { isGit, workspaceId: workspace.id }, authority);
         rememberDescriptorState(workspace.id, workspace);
       } catch (error) {
+        if (!workspaceSyncIsCurrent(workspace.id, syncGeneration)) continue;
         removeForWorkspaceId(workspace.id);
         logger.warn(
-          { err: error, cwd: workspace.workspaceDirectory, workspaceId: workspace.id },
+          {
+            err: error,
+            cwd: workspace.workspaceDirectory,
+            workspaceId: workspace.id,
+          },
           "Skipped stale Maya restricted workspace observer",
         );
       }
@@ -374,6 +424,8 @@ export function createWorkspaceGitObserverService(deps: {
     removeForWorkspaceId,
 
     dispose() {
+      disposed = true;
+      workspaceSyncGenerations.clear();
       for (const cwd of [...subscriptions.keys()]) removeForCwd(cwd);
       watchTargets.clear();
       workspaceStates.clear();

@@ -44,7 +44,10 @@ function makeDescriptor(overrides: {
 }
 
 function makeSnapshot(cwd: string, currentBranch: string | null): WorkspaceGitRuntimeSnapshot {
-  return { cwd, git: { currentBranch } } as unknown as WorkspaceGitRuntimeSnapshot;
+  return {
+    cwd,
+    git: { currentBranch },
+  } as unknown as WorkspaceGitRuntimeSnapshot;
 }
 
 function makeRecord(workspaceId: string): PersistedWorkspaceRecord {
@@ -149,7 +152,9 @@ function buildHarness(
     onBranchChanged: (workspaceId, oldBranch, newBranch) => {
       branchChanges.push([workspaceId, oldBranch, newBranch]);
     },
-    logger: { warn: (...args: unknown[]) => warnCalls.push(args) } as unknown as pino.Logger,
+    logger: {
+      warn: (...args: unknown[]) => warnCalls.push(args),
+    } as unknown as pino.Logger,
     ...(opts.restrictedAuthority || opts.openRestrictedAuthority
       ? {
           openMayaRestrictedWorkspaceAuthority:
@@ -206,7 +211,11 @@ describe("syncObservers", () => {
   test("registers a Git workspace even when its owning project is non-Git", () => {
     const h = buildHarness();
     h.service.syncObservers([
-      makeDescriptor({ id: "ws1", workspaceDirectory: WS1, projectKind: "non_git" }),
+      makeDescriptor({
+        id: "ws1",
+        workspaceDirectory: WS1,
+        projectKind: "non_git",
+      }),
     ]);
     expect(h.registerCalls).toEqual([WS1]);
   });
@@ -271,6 +280,57 @@ describe("syncObservers", () => {
     h.emitSnapshot(WS2, "healthy-branch");
     await flushMicrotasks();
     expect(h.statusCalls).toEqual([{ cwd: WS2, branch: "healthy-branch" }]);
+  });
+
+  test("does not recreate a restricted observer after removal during authority admission", async () => {
+    const authorityOpened = deferred<MayaRestrictedWorkspaceAuthority>();
+    const release = vi.fn(async () => undefined);
+    const authority = {
+      ...fakeAuthority(WS1, "ws1"),
+      release,
+    };
+    const h = buildHarness({
+      openRestrictedAuthority: async () => authorityOpened.promise,
+    });
+    const sync = h.service.syncMayaRestrictedObservers([
+      makeDescriptor({ id: "ws1", workspaceDirectory: WS1 }),
+    ]);
+    await Promise.resolve();
+    h.service.removeForWorkspaceId("ws1");
+    authorityOpened.resolve(authority);
+    await sync;
+
+    expect(h.registerCalls).toEqual([]);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(h.service.getMetrics()).toEqual({
+      watchedDirectoryCount: 0,
+      workspaceRecordCount: 0,
+      subscriptionCount: 0,
+    });
+  });
+
+  test("does not let a stale restricted admission remove a newer ordinary observer", async () => {
+    const authorityOpened = deferred<MayaRestrictedWorkspaceAuthority>();
+    const release = vi.fn(async () => undefined);
+    const authority = {
+      ...fakeAuthority(WS1, "ws1"),
+      release,
+    };
+    const h = buildHarness({
+      openRestrictedAuthority: async () => authorityOpened.promise,
+    });
+    const descriptor = makeDescriptor({ id: "ws1", workspaceDirectory: WS1 });
+    const sync = h.service.syncMayaRestrictedObservers([descriptor]);
+    await Promise.resolve();
+    h.service.syncObservers([descriptor]);
+    authorityOpened.resolve(authority);
+    await sync;
+
+    expect(h.registerCalls).toEqual([WS1]);
+    expect(h.unsubscribeCalls).toEqual([]);
+    expect(release).toHaveBeenCalledTimes(1);
+    h.emitSnapshot(WS1, "ordinary");
+    expect(h.statusCalls).toEqual([{ cwd: WS1, branch: "ordinary" }]);
   });
 
   test("tears down the subscription when a git workspace becomes non-git", () => {
@@ -432,8 +492,16 @@ describe("shouldSkipUpdate", () => {
   test("skips a repeat descriptor state and re-emits when it changes", () => {
     const h = buildHarness();
     h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
-    const a = makeDescriptor({ id: "ws1", workspaceDirectory: WS1, name: "main" });
-    const b = makeDescriptor({ id: "ws1", workspaceDirectory: WS1, name: "feature" });
+    const a = makeDescriptor({
+      id: "ws1",
+      workspaceDirectory: WS1,
+      name: "main",
+    });
+    const b = makeDescriptor({
+      id: "ws1",
+      workspaceDirectory: WS1,
+      name: "feature",
+    });
     expect(h.service.shouldSkipUpdate("ws1", a)).toBe(false);
     expect(h.service.shouldSkipUpdate("ws1", a)).toBe(true);
     expect(h.service.shouldSkipUpdate("ws1", b)).toBe(false);
@@ -441,7 +509,11 @@ describe("shouldSkipUpdate", () => {
 
   test("starts from the descriptor state recorded during observer sync", () => {
     const h = buildHarness();
-    const descriptor = makeDescriptor({ id: "ws1", workspaceDirectory: WS1, name: "main" });
+    const descriptor = makeDescriptor({
+      id: "ws1",
+      workspaceDirectory: WS1,
+      name: "main",
+    });
     h.service.syncObservers([descriptor]);
     expect(h.service.shouldSkipUpdate("ws1", descriptor)).toBe(true);
   });
@@ -506,8 +578,18 @@ describe("teardown", () => {
   test("keeps a shared cwd subscription until its last workspace is removed", () => {
     const h = buildHarness();
     h.service.syncObservers([
-      makeDescriptor({ id: "ws1", workspaceDirectory: WS1, name: "Main", currentBranch: "main" }),
-      makeDescriptor({ id: "ws2", workspaceDirectory: WS1, name: "Main", currentBranch: "main" }),
+      makeDescriptor({
+        id: "ws1",
+        workspaceDirectory: WS1,
+        name: "Main",
+        currentBranch: "main",
+      }),
+      makeDescriptor({
+        id: "ws2",
+        workspaceDirectory: WS1,
+        name: "Main",
+        currentBranch: "main",
+      }),
     ]);
 
     h.emitSnapshot(WS1, "feature");
@@ -540,7 +622,11 @@ describe("teardown", () => {
     const h = buildHarness();
     h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
     h.service.dispose();
-    const descriptor = makeDescriptor({ id: "ws1", workspaceDirectory: WS1, name: "main" });
+    const descriptor = makeDescriptor({
+      id: "ws1",
+      workspaceDirectory: WS1,
+      name: "main",
+    });
     expect(h.service.shouldSkipUpdate("ws1", descriptor)).toBe(false);
     h.service.recordDescriptorState("ws1", descriptor);
     expect(h.branchChanges).toEqual([]);

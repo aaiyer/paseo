@@ -1,6 +1,8 @@
 import type { FileHandle } from "node:fs/promises";
 
 export interface MayaRestrictedGitLaunchContext {
+  readonly workspacePath: string;
+  readonly gitDirectoryRelativeToCommon: string;
   readonly rootHandle: FileHandle;
   readonly gitDirectoryHandle: FileHandle;
   readonly commonDirectoryHandle: FileHandle;
@@ -11,6 +13,7 @@ export interface MayaRestrictedWorkspaceAuthorityBinding {
   readonly cwd: string;
   readonly rootAccessPath: string;
   readonly gitLaunchContext: MayaRestrictedGitLaunchContext | null;
+  retainAuthority(): () => Promise<void>;
   validateGitAssociation(): Promise<void>;
 }
 

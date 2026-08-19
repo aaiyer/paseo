@@ -20,6 +20,9 @@ import {
   configureGitProcessPolicy,
   runGitCommand,
   snapshotGitCommandRuntimeMetrics,
+  startGitCommandMetrics,
+  stopGitCommandMetrics,
+  waitForGitCommandMetricsIdle,
 } from "../utils/run-git-command.js";
 import { DEFAULT_GIT_PROCESS_POLICY } from "../utils/git-process-scheduler.js";
 import type {
@@ -56,7 +59,10 @@ describe("paseo daemon bootstrap", () => {
 
   test("starts and serves health endpoint", async () => {
     const daemonHandle = await createTestPaseoDaemon({
-      openai: { stt: { apiKey: "test-openai-api-key" }, tts: { apiKey: "test-openai-api-key" } },
+      openai: {
+        stt: { apiKey: "test-openai-api-key" },
+        tts: { apiKey: "test-openai-api-key" },
+      },
       speech: {
         providers: {
           dictationStt: { provider: "openai", explicit: true },
@@ -193,6 +199,8 @@ describe("paseo daemon bootstrap", () => {
     };
     const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
     let client: DaemonClient | null = null;
+    let gitMetricsRunning = true;
+    startGitCommandMetrics();
 
     try {
       await daemon.start();
@@ -203,9 +211,14 @@ describe("paseo daemon bootstrap", () => {
         appVersion: "0.4.0",
       });
       await client.connect();
-      const response = await client.fetchWorkspaces({ requestId: "restricted-real-session" });
+      const response = await client.fetchWorkspaces({
+        requestId: "restricted-real-session",
+      });
       expect(response.entries.map((workspace) => workspace.id)).toContain("workspace-maya");
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitForGitCommandMetricsIdle({ quietMs: 50, timeoutMs: 2_000 });
+      const gitMetrics = stopGitCommandMetrics();
+      gitMetricsRunning = false;
+      expect(gitMetrics.submissions.some(({ args }) => args[0] === "fetch")).toBe(false);
       expect(remoteRequests).toBe(0);
 
       const agent = await daemon.agentManager.createAgent(
@@ -222,6 +235,14 @@ describe("paseo daemon bootstrap", () => {
         ]),
       ).toEqual([projectBytes, workspaceBytes, generationBytes]);
     } finally {
+      if (gitMetricsRunning) {
+        try {
+          stopGitCommandMetrics();
+        } catch {
+          // The daemon shutdown below owns any still-running command. A failed
+          // idle assertion remains the primary test failure.
+        }
+      }
       await client?.close().catch(() => undefined);
       await daemon.stop().catch(() => undefined);
       await daemon.agentManager.flush().catch(() => undefined);
@@ -268,7 +289,11 @@ describe("paseo daemon bootstrap", () => {
     config.speech = {
       providers: {
         dictationStt: { provider: "local", explicit: true, enabled: false },
-        voiceTurnDetection: { provider: "local", explicit: true, enabled: false },
+        voiceTurnDetection: {
+          provider: "local",
+          explicit: true,
+          enabled: false,
+        },
         voiceStt: { provider: "local", explicit: true, enabled: false },
         voiceTts: { provider: "local", explicit: true, enabled: false },
       },
@@ -384,7 +409,12 @@ describe("paseo daemon bootstrap", () => {
   ): Promise<Response> {
     return new Promise((resolve, reject) => {
       const req = http.get(
-        { hostname: "127.0.0.1", port, path: requestPath, headers: { host, ...headers } },
+        {
+          hostname: "127.0.0.1",
+          port,
+          path: requestPath,
+          headers: { host, ...headers },
+        },
         (res) => {
           const chunks: Buffer[] = [];
           res.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -561,7 +591,10 @@ describe("paseo daemon bootstrap", () => {
         },
         credential: { secret: "credential" },
         enrollment: { token: "enrollment-token" },
-        identity: { serverId: "server-startup-race", daemonPublicKey: "public-key" },
+        identity: {
+          serverId: "server-startup-race",
+          daemonPublicKey: "public-key",
+        },
       })}\n`,
       "utf-8",
     );
@@ -741,7 +774,9 @@ export default function contribute(plugin: unknown) {
       pluginsEnabled: !isPlatform("win32"),
       plugins: isPlatform("win32")
         ? {}
-        : { "startup-rollback": { source: "directory", path: pluginDirectory } },
+        : {
+            "startup-rollback": { source: "directory", path: pluginDirectory },
+          },
     };
     const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
 
@@ -749,7 +784,9 @@ export default function contribute(plugin: unknown) {
       await expect(daemon.start()).rejects.toThrow();
       await expect(fetch(`http://127.0.0.1:${standalonePort}/api/health`)).rejects.toThrow();
       if (!isPlatform("win32")) {
-        await expect(readFile(pluginPidPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readFile(pluginPidPath, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
       }
     } finally {
       await daemon.stop().catch(() => undefined);
@@ -864,7 +901,11 @@ export default function contribute(plugin: unknown) {
       speech: {
         providers: {
           dictationStt: { provider: "local", explicit: true, enabled: true },
-          voiceTurnDetection: { provider: "local", explicit: true, enabled: false },
+          voiceTurnDetection: {
+            provider: "local",
+            explicit: true,
+            enabled: false,
+          },
           voiceStt: { provider: "local", explicit: true, enabled: false },
           voiceTts: { provider: "local", explicit: true, enabled: false },
         },
@@ -1020,7 +1061,9 @@ async function beginDaemonShutdownWithAgentClosing(): Promise<BlockedDaemonShutd
   const heldAgentClose = holdAgentClose();
   const daemonHandle = await createTestPaseoDaemon({
     cleanup: false,
-    agentClients: createTestAgentClients({ closeSession: heldAgentClose.closeSession }),
+    agentClients: createTestAgentClients({
+      closeSession: heldAgentClose.closeSession,
+    }),
   });
   const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-shutdown-agent-"));
   await daemonHandle.daemon.agentManager.createAgent(
@@ -1061,7 +1104,10 @@ async function beginDaemonShutdownWithAgentClosing(): Promise<BlockedDaemonShutd
       await stopPromise;
       await daemonHandle.daemon.agentManager.flush().catch(() => undefined);
       await Promise.all([
-        rm(path.dirname(daemonHandle.paseoHome), { recursive: true, force: true }),
+        rm(path.dirname(daemonHandle.paseoHome), {
+          recursive: true,
+          force: true,
+        }),
         rm(daemonHandle.staticDir, { recursive: true, force: true }),
         rm(agentCwd, { recursive: true, force: true }),
       ]);

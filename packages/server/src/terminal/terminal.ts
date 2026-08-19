@@ -13,6 +13,10 @@ import type { TerminalCell, TerminalState } from "@getpaseo/protocol/messages";
 import { TerminalInputModeTracker } from "@getpaseo/protocol/terminal-input-mode";
 import { TerminalActivityTracker } from "./activity/terminal-activity-tracker.js";
 import type { TerminalActivity, TerminalActivityState } from "@getpaseo/protocol/terminal-activity";
+import {
+  buildMayaRestrictedSandboxArgs,
+  MAYA_RESTRICTED_BWRAP,
+} from "../server/maya-restricted-sandbox.js";
 
 const { Terminal } = xterm;
 const require = createRequire(import.meta.url);
@@ -60,7 +64,13 @@ export interface TerminalSubscribeOptions {
 export type ClientMessage =
   | { type: "input"; data: string }
   | { type: "resize"; rows: number; cols: number }
-  | { type: "mouse"; row: number; col: number; button: number; action: "down" | "up" | "move" };
+  | {
+      type: "mouse";
+      row: number;
+      col: number;
+      button: number;
+      action: "down" | "up" | "move";
+    };
 
 export type ServerMessage =
   | { type: "output"; data: string; revision?: number }
@@ -135,7 +145,6 @@ export interface CreateTerminalOptions {
   };
 }
 
-const MAYA_RESTRICTED_BWRAP = "/usr/bin/bwrap";
 const MAYA_RESTRICTED_SHELL = "/bin/bash";
 const MAYA_RESTRICTED_SHELL_VALIDATOR = `
 set -eu
@@ -158,31 +167,24 @@ function resolveMayaRestrictedTerminalSpawn(input: {
   return {
     command: MAYA_RESTRICTED_BWRAP,
     shell: MAYA_RESTRICTED_SHELL,
-    args: [
-      "--die-with-parent",
-      "--new-session",
-      "--unshare-all",
-      "--ro-bind",
-      "/",
-      "/",
-      "--proc",
-      "/proc",
-      "--dev",
-      "/dev",
-      "--tmpfs",
-      "/tmp",
-      "--bind",
-      input.workspaceRoot,
-      input.workspaceRoot,
-      "--chdir",
-      input.workspaceRoot,
-      MAYA_RESTRICTED_SHELL,
-      "-c",
-      MAYA_RESTRICTED_SHELL_VALIDATOR,
-      "maya-paseo-terminal-validator",
-      input.workspaceRoot,
-      `${input.rootDevice}:${input.rootInode}`,
-    ],
+    args: buildMayaRestrictedSandboxArgs({
+      cwd: input.workspaceRoot,
+      bindings: [
+        {
+          source: input.workspaceRoot,
+          destination: input.workspaceRoot,
+          writable: true,
+        },
+      ],
+      command: MAYA_RESTRICTED_SHELL,
+      args: [
+        "-c",
+        MAYA_RESTRICTED_SHELL_VALIDATOR,
+        "maya-paseo-terminal-validator",
+        input.workspaceRoot,
+        `${input.rootDevice}:${input.rootInode}`,
+      ],
+    }),
   };
 }
 

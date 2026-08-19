@@ -106,7 +106,11 @@ describe("WorkspaceFilesSession", () => {
     } as unknown as MayaRestrictedWorkspaceAuthority;
     const fileObserver = {
       subscribe: vi.fn(async () => ({
-        initial: { status: "missing" as const, cwd: authority.cwd, path: "notes.txt" },
+        initial: {
+          status: "missing" as const,
+          cwd: authority.cwd,
+          path: "notes.txt",
+        },
         unsubscribe: observerUnsubscribe,
       })),
     } as unknown as FileObserver;
@@ -157,9 +161,15 @@ describe("WorkspaceFilesSession", () => {
       subscriptionId: "shared-subscription",
     };
 
-    const first = subsystem.handleFileSubscribeRequest({ ...request, requestId: "first" });
+    const first = subsystem.handleFileSubscribeRequest({
+      ...request,
+      requestId: "first",
+    });
     await vi.waitFor(() => expect(pending).toHaveLength(1));
-    const second = subsystem.handleFileSubscribeRequest({ ...request, requestId: "second" });
+    const second = subsystem.handleFileSubscribeRequest({
+      ...request,
+      requestId: "second",
+    });
     await vi.waitFor(() => expect(pending).toHaveLength(2));
 
     pending[1]?.({
@@ -185,6 +195,71 @@ describe("WorkspaceFilesSession", () => {
     expect(secondUnsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  test.each(["unsubscribe", "dispose"] as const)(
+    "does not attach a replacement after deferred prior release and %s",
+    async (cancellation) => {
+      let finishRelease: (() => void) | undefined;
+      const releaseFinished = new Promise<void>((resolve) => {
+        finishRelease = resolve;
+      });
+      const cwd = makeDir("workspace-files-deferred-release-");
+      const authority = {
+        cwd,
+        workspaceId: "workspace",
+        rootAccessPath: cwd,
+        retain: () => authority,
+        release: vi.fn(() => releaseFinished),
+        isCurrent: vi.fn(async () => true),
+      } as unknown as MayaRestrictedWorkspaceAuthority;
+      const firstUnsubscribe = vi.fn();
+      const fileObserver = {
+        subscribe: vi.fn(async (input: { cwd: string; path: string }) => ({
+          initial: {
+            status: "missing" as const,
+            cwd: input.cwd,
+            path: input.path,
+          },
+          unsubscribe: firstUnsubscribe,
+        })),
+      } as unknown as FileObserver;
+      const { subsystem, emitted } = makeSubsystem({ fileObserver });
+      const request = {
+        type: "fs.file.subscribe.request" as const,
+        cwd,
+        path: "notes.txt",
+        subscriptionId: "shared",
+      };
+      await subsystem.handleFileSubscribeRequest({ ...request, requestId: "first" }, authority);
+      const replacement = subsystem.handleFileSubscribeRequest({
+        ...request,
+        requestId: "replacement",
+      });
+      await vi.waitFor(() => expect(authority.release).toHaveBeenCalledTimes(1));
+
+      const cancellationPromise =
+        cancellation === "dispose"
+          ? subsystem.dispose()
+          : subsystem.handleFileUnsubscribeRequest({
+              type: "fs.file.unsubscribe.request",
+              subscriptionId: "shared",
+              requestId: "unsubscribe",
+            });
+      await cancellationPromise;
+      finishRelease?.();
+      await replacement;
+
+      expect(fileObserver.subscribe).toHaveBeenCalledTimes(1);
+      expect(firstUnsubscribe).toHaveBeenCalledTimes(1);
+      expect(
+        emitted.some(
+          (message) =>
+            message.type === "fs.file.subscribe.response" &&
+            message.payload.requestId === "replacement",
+        ),
+      ).toBe(false);
+    },
+  );
+
   test("suppresses an old update when its subscription generation changes during authority validation", async () => {
     type ObserverListener = Parameters<FileObserver["subscribe"]>[1];
     const listeners: ObserverListener[] = [];
@@ -193,7 +268,11 @@ describe("WorkspaceFilesSession", () => {
       subscribe: vi.fn(async (input: { cwd: string; path: string }, next: ObserverListener) => {
         const index = listeners.push(next) - 1;
         return {
-          initial: { status: "missing" as const, cwd: input.cwd, path: input.path },
+          initial: {
+            status: "missing" as const,
+            cwd: input.cwd,
+            path: input.path,
+          },
           unsubscribe: unsubscribes[index],
         };
       }),
@@ -236,7 +315,10 @@ describe("WorkspaceFilesSession", () => {
       revision: "1:2:3:4",
     });
     await atValidation;
-    await subsystem.handleFileSubscribeRequest({ ...request, requestId: "new" });
+    await subsystem.handleFileSubscribeRequest({
+      ...request,
+      requestId: "new",
+    });
     finishValidation?.();
 
     await vi.waitFor(() => expect(unsubscribes[0]).toHaveBeenCalledTimes(1));
@@ -497,7 +579,9 @@ describe("WorkspaceFilesSession", () => {
   test("reads file content inline when the client has no binary channel", async () => {
     const cwd = makeDir("workspace-files-read-");
     writeFileSync(join(cwd, "notes.txt"), "hello world");
-    const { subsystem, emitted, binary } = makeSubsystem({ hasBinaryChannel: false });
+    const { subsystem, emitted, binary } = makeSubsystem({
+      hasBinaryChannel: false,
+    });
 
     await subsystem.handleFileExplorerRequest({
       type: "file_explorer_request",
@@ -593,7 +677,9 @@ describe("WorkspaceFilesSession", () => {
   test("streams binary frames when the client accepts binary and has a channel", async () => {
     const cwd = makeDir("workspace-files-binary-");
     writeFileSync(join(cwd, "notes.txt"), "hello world");
-    const { subsystem, emitted, binary } = makeSubsystem({ hasBinaryChannel: true });
+    const { subsystem, emitted, binary } = makeSubsystem({
+      hasBinaryChannel: true,
+    });
 
     await subsystem.handleFileExplorerRequest({
       type: "file_explorer_request",
@@ -661,7 +747,10 @@ describe("WorkspaceFilesSession", () => {
     expect(emitted).toEqual([
       expect.objectContaining({
         type: "file_explorer_response",
-        payload: expect.objectContaining({ requestId: "req-unrelated-list", error: null }),
+        payload: expect.objectContaining({
+          requestId: "req-unrelated-list",
+          error: null,
+        }),
       }),
     ]);
 
@@ -802,7 +891,10 @@ describe("WorkspaceFilesSession", () => {
       }),
     );
     await subsystem.handleFileTransferFrame(
-      uploadFrame({ opcode: FileTransferOpcode.FileEnd, requestId: "req-upload" }),
+      uploadFrame({
+        opcode: FileTransferOpcode.FileEnd,
+        requestId: "req-upload",
+      }),
     );
 
     const message = emitted.find((entry) => entry.type === "file.upload.response");

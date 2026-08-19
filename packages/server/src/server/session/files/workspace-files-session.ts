@@ -56,6 +56,13 @@ export interface WorkspaceFilesSessionOptions {
   fileObserver?: FileObserver;
 }
 
+interface FileSubscriptionState {
+  readonly generation: number;
+  active: boolean;
+  observerUnsubscribe: (() => void) | null;
+  unsubscribe(): Promise<void>;
+}
+
 /**
  * A client's workspace file-access surface: browsing directories, reading file
  * contents (inline JSON or binary frames), receiving uploads, issuing download
@@ -69,7 +76,9 @@ export class WorkspaceFilesSession {
   private readonly logger: pino.Logger;
   private readonly fileUploads: FileUploadStore;
   private readonly fileObserver: FileObserver;
-  private readonly fileSubscriptions = new Map<string, () => Promise<void>>();
+  private readonly fileSubscriptions = new Map<string, FileSubscriptionState>();
+  private nextFileSubscriptionGeneration = 1;
+  private disposed = false;
 
   constructor(options: WorkspaceFilesSessionOptions) {
     this.host = options.host;
@@ -83,36 +92,50 @@ export class WorkspaceFilesSession {
     request: FileSubscribeRequest,
     authority?: MayaRestrictedWorkspaceAuthority | null,
   ): Promise<void> {
-    await this.fileSubscriptions.get(request.subscriptionId)?.();
+    if (this.disposed) throw new Error("workspace file session is disposed");
+    const previous = this.fileSubscriptions.get(request.subscriptionId);
     const retainedAuthority = authority?.retain();
-    let active = true;
-    let observerUnsubscribe: (() => void) | null = null;
-    const unsubscribe = async () => {
-      if (!active) return;
-      active = false;
-      const observer = observerUnsubscribe;
-      observerUnsubscribe = null;
-      observer?.();
-      await retainedAuthority?.release();
+    let releasePromise: Promise<void> | null = null;
+    const state: FileSubscriptionState = {
+      generation: this.nextFileSubscriptionGeneration,
+      active: true,
+      observerUnsubscribe: null,
+      unsubscribe: async () => {
+        state.active = false;
+        const observer = state.observerUnsubscribe;
+        state.observerUnsubscribe = null;
+        observer?.();
+        releasePromise ??= (async () => {
+          await retainedAuthority?.release();
+          if (this.fileSubscriptions.get(request.subscriptionId) === state) {
+            this.fileSubscriptions.delete(request.subscriptionId);
+          }
+        })();
+        return releasePromise;
+      },
     };
-    this.fileSubscriptions.set(request.subscriptionId, unsubscribe);
+    this.nextFileSubscriptionGeneration += 1;
+    this.fileSubscriptions.set(request.subscriptionId, state);
+    await previous?.unsubscribe();
+    if (this.fileSubscriptions.get(request.subscriptionId) !== state || this.disposed) {
+      await state.unsubscribe();
+      return;
+    }
     try {
       const subscription = await this.fileObserver.subscribe(
         { cwd: authority?.rootAccessPath ?? request.cwd, path: request.path },
         (version) => {
           void (async () => {
             const generationIsCurrent =
-              this.fileSubscriptions.get(request.subscriptionId) === unsubscribe;
+              this.fileSubscriptions.get(request.subscriptionId) === state;
             const authorityIsCurrent = !retainedAuthority || (await retainedAuthority.isCurrent());
             if (
               !generationIsCurrent ||
               !authorityIsCurrent ||
-              this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe
+              this.fileSubscriptions.get(request.subscriptionId) !== state ||
+              !state.active
             ) {
-              await unsubscribe();
-              if (this.fileSubscriptions.get(request.subscriptionId) === unsubscribe) {
-                this.fileSubscriptions.delete(request.subscriptionId);
-              }
+              await state.unsubscribe();
               return;
             }
             this.host.emit({
@@ -125,17 +148,16 @@ export class WorkspaceFilesSession {
           })();
         },
       );
-      observerUnsubscribe = subscription.unsubscribe;
-      if (!active || this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe) {
-        observerUnsubscribe();
-        observerUnsubscribe = null;
+      state.observerUnsubscribe = subscription.unsubscribe;
+      if (!state.active || this.fileSubscriptions.get(request.subscriptionId) !== state) {
+        await state.unsubscribe();
         return;
       }
       if (retainedAuthority && !(await retainedAuthority.isCurrent())) {
         throw new Error("workspace authority changed while opening file subscription");
       }
-      if (!active || this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe) {
-        await unsubscribe();
+      if (!state.active || this.fileSubscriptions.get(request.subscriptionId) !== state) {
+        await state.unsubscribe();
         return;
       }
       this.host.emit({
@@ -147,10 +169,9 @@ export class WorkspaceFilesSession {
         },
       });
     } catch (error) {
-      const isCurrent = this.fileSubscriptions.get(request.subscriptionId) === unsubscribe;
-      await unsubscribe();
+      const isCurrent = this.fileSubscriptions.get(request.subscriptionId) === state;
+      await state.unsubscribe();
       if (!isCurrent) return;
-      this.fileSubscriptions.delete(request.subscriptionId);
       this.host.emit({
         type: "fs.file.subscribe.response",
         payload: {
@@ -168,11 +189,13 @@ export class WorkspaceFilesSession {
   }
 
   async handleFileUnsubscribeRequest(request: FileUnsubscribeRequest): Promise<void> {
-    await this.fileSubscriptions.get(request.subscriptionId)?.();
-    this.fileSubscriptions.delete(request.subscriptionId);
+    await this.fileSubscriptions.get(request.subscriptionId)?.unsubscribe();
     this.host.emit({
       type: "fs.file.unsubscribe.response",
-      payload: { subscriptionId: request.subscriptionId, requestId: request.requestId },
+      payload: {
+        subscriptionId: request.subscriptionId,
+        requestId: request.requestId,
+      },
     });
   }
 
@@ -265,9 +288,10 @@ export class WorkspaceFilesSession {
   }
 
   async dispose(): Promise<void> {
-    const unsubscribes = [...this.fileSubscriptions.values()];
-    await Promise.all(unsubscribes.map((unsubscribe) => unsubscribe()));
+    this.disposed = true;
+    const subscriptions = [...this.fileSubscriptions.values()];
     this.fileSubscriptions.clear();
+    await Promise.all(subscriptions.map((subscription) => subscription.unsubscribe()));
   }
 
   async handleFileExplorerRequest(

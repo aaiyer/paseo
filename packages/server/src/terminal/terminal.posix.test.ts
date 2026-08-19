@@ -72,7 +72,11 @@ async function waitForLines(
   }
   const actual = getLines(session.getState()).slice(0, expectedLines.length);
   throw new Error(
-    `Timeout waiting for expected lines.\nExpected:\n${JSON.stringify(expectedLines, null, 2)}\nActual:\n${JSON.stringify(actual, null, 2)}`,
+    `Timeout waiting for expected lines.\nExpected:\n${JSON.stringify(
+      expectedLines,
+      null,
+      2,
+    )}\nActual:\n${JSON.stringify(actual, null, 2)}`,
   );
 }
 
@@ -285,7 +289,9 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
     const integrationSourceDir = mkdtempSync(join(tmpdir(), "paseo-zsh-readonly-source-"));
     const tmpHome = mkdtempSync(join(tmpdir(), "paseo-zsh-readonly-home-"));
     temporaryDirs.push(integrationSourceDir, tmpHome);
-    cpSync(resolveZshShellIntegrationDir(), integrationSourceDir, { recursive: true });
+    cpSync(resolveZshShellIntegrationDir(), integrationSourceDir, {
+      recursive: true,
+    });
     chmodSync(join(integrationSourceDir, ".zshenv"), 0o444);
     chmodSync(join(integrationSourceDir, "paseo-integration.zsh"), 0o444);
     removeZshShellIntegrationRuntimeDir();
@@ -453,7 +459,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       });
 
       await waitForLines(session, ["$"]);
-      session.send({ type: "input", data: "printf '\\033]0;Build Log\\007'\r" });
+      session.send({
+        type: "input",
+        data: "printf '\\033]0;Build Log\\007'\r",
+      });
 
       await waitForTitle(session, (title) => title === "Build Log");
 
@@ -476,7 +485,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       );
 
       await waitForLines(session, ["$"]);
-      session.send({ type: "input", data: "printf '\\033]0;Build Log\\007'\r" });
+      session.send({
+        type: "input",
+        data: "printf '\\033]0;Build Log\\007'\r",
+      });
       await new Promise((resolve) => setTimeout(resolve, 150));
 
       expect(session.getTitle()).toBe("typecheck");
@@ -538,7 +550,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       });
 
       await waitForLines(session, ["$"]);
-      session.send({ type: "input", data: "./emit-malformed-command-finished.sh\r" });
+      session.send({
+        type: "input",
+        data: "./emit-malformed-command-finished.sh\r",
+      });
 
       await waitForState(session, () => commandCompletions.length === 1);
 
@@ -645,7 +660,9 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
         "zsh",
       );
       mkdirSync(unpackedIntegrationDir, { recursive: true });
-      cpSync(resolveZshShellIntegrationDir(), unpackedIntegrationDir, { recursive: true });
+      cpSync(resolveZshShellIntegrationDir(), unpackedIntegrationDir, {
+        recursive: true,
+      });
       writeFileSync(join(fakeAppRoot, "app.asar"), "asar archive placeholder");
 
       const env = buildTerminalEnvironment({
@@ -748,7 +765,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       await waitForLines(session, ["$"]);
 
       // \033[38;5;208m = 256-color orange (color 208)
-      session.send({ type: "input", data: "printf '\\033[38;5;208mORG\\033[0m'\r" });
+      session.send({
+        type: "input",
+        data: "printf '\\033[38;5;208mORG\\033[0m'\r",
+      });
 
       await waitForLines(session, ["$ printf '\\033[38;5;208mORG\\033[0m'", "ORG$"]);
 
@@ -774,7 +794,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       await waitForLines(session, ["$"]);
 
       // \033[38;2;255;128;64m = true color RGB(255, 128, 64)
-      session.send({ type: "input", data: "printf '\\033[38;2;255;128;64mRGB\\033[0m'\r" });
+      session.send({
+        type: "input",
+        data: "printf '\\033[38;2;255;128;64mRGB\\033[0m'\r",
+      });
 
       await waitForLines(session, ["$ printf '\\033[38;2;255;128;64mRGB\\033[0m'", "RGB$"]);
 
@@ -964,7 +987,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       );
       await waitForLines(session, ["$"]);
 
-      session.send({ type: "input", data: `${process.execPath} ${helperPath}\r` });
+      session.send({
+        type: "input",
+        data: `${process.execPath} ${helperPath}\r`,
+      });
       await waitForState(session, hasDaOkLine);
 
       const ack = getLines(session.getState()).find(isDaOkLine) ?? "";
@@ -984,7 +1010,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       );
       await waitForLines(session, ["$"]);
 
-      session.send({ type: "input", data: `${process.execPath} ${helperPath}\r` });
+      session.send({
+        type: "input",
+        data: `${process.execPath} ${helperPath}\r`,
+      });
       await waitForState(session, hasDaOkLine);
       await waitForState(session, lastNonEmptyLineIsPrompt);
     });
@@ -1002,7 +1031,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       );
       await waitForLines(session, ["$"]);
 
-      session.send({ type: "input", data: `${process.execPath} ${helperPath} cursor\r` });
+      session.send({
+        type: "input",
+        data: `${process.execPath} ${helperPath} cursor\r`,
+      });
       await waitForState(session, hasDsrOkLine);
 
       const ack = getLines(session.getState()).find(isDsrOkLine) ?? "";
@@ -1022,7 +1054,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       );
       await waitForLines(session, ["$"]);
 
-      session.send({ type: "input", data: `${process.execPath} ${helperPath} private-cursor\r` });
+      session.send({
+        type: "input",
+        data: `${process.execPath} ${helperPath} private-cursor\r`,
+      });
       await waitForState(session, hasDsrOkLine);
 
       const ack = getLines(session.getState()).find(isDsrOkLine) ?? "";
@@ -1042,7 +1077,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       );
       await waitForLines(session, ["$"]);
 
-      session.send({ type: "input", data: `${process.execPath} ${helperPath} status\r` });
+      session.send({
+        type: "input",
+        data: `${process.execPath} ${helperPath} status\r`,
+      });
       await waitForState(session, hasDsrOkLine);
 
       const ack = getLines(session.getState()).find(isDsrOkLine) ?? "";
@@ -1062,7 +1100,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       );
       await waitForLines(session, ["$"]);
 
-      session.send({ type: "input", data: `${process.execPath} ${helperPath}\r` });
+      session.send({
+        type: "input",
+        data: `${process.execPath} ${helperPath}\r`,
+      });
       await waitForState(session, hasOsc11OkLine);
 
       const ack = getLines(session.getState()).find(isOsc11OkLine) ?? "";
@@ -1261,7 +1302,10 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
       it("keeps only the selected registered workspace writable and has no network", async () => {
         const workspace = mkdtempSync(join(tmpdir(), "paseo-terminal-selected-"));
         const sibling = mkdtempSync(join(tmpdir(), "paseo-terminal-sibling-"));
-        temporaryDirs.push(workspace, sibling);
+        const secretRoot = mkdtempSync(join(tmpdir(), "paseo-terminal-secret-"));
+        const secret = join(secretRoot, "credential.txt");
+        writeFileSync(secret, "host credential\n", { mode: 0o600 });
+        temporaryDirs.push(workspace, sibling, secretRoot);
         const checkScript = join(workspace, "sandbox-check.sh");
         writeFileSync(
           checkScript,
@@ -1269,6 +1313,8 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
             "#!/bin/bash",
             "printf selected > selected.txt",
             `if printf sibling > '${sibling}/forbidden'; then echo 'RESULT:sibling=bad'; else echo 'RESULT:sibling=denied'; fi`,
+            `if cat '${secret}' >/dev/null; then echo 'RESULT:secret=bad'; else echo 'RESULT:secret=denied'; fi`,
+            `if ln '${secret}' leaked-secret; then echo 'RESULT:hardlink=bad'; else echo 'RESULT:hardlink=denied'; fi`,
             "if printf state > /tmp/../var/tmp/paseo-forbidden; then echo 'RESULT:host=bad'; else echo 'RESULT:host=denied'; fi",
             "if (echo >/dev/tcp/1.1.1.1/80) 2>/dev/null; then echo 'RESULT:network=bad'; else echo 'RESULT:network=denied'; fi",
             "echo 'RESULT:done'",
@@ -1298,13 +1344,18 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
         );
         const output = [...state.scrollback, ...state.grid].map(rowToText).join("\n");
         expect(output).toContain("RESULT:sibling=denied");
+        expect(output).toContain("RESULT:secret=denied");
+        expect(output).toContain("RESULT:hardlink=denied");
         expect(output).toContain("RESULT:host=denied");
         expect(output).toContain("RESULT:network=denied");
         expect(output).not.toContain("RESULT:sibling=bad");
+        expect(output).not.toContain("RESULT:secret=bad");
+        expect(output).not.toContain("RESULT:hardlink=bad");
         expect(output).not.toContain("RESULT:host=bad");
         expect(output).not.toContain("RESULT:network=bad");
         expect(readFileSync(join(workspace, "selected.txt"), "utf8")).toBe("selected");
         expect(existsSync(join(sibling, "forbidden"))).toBe(false);
+        expect(existsSync(join(workspace, "leaked-secret"))).toBe(false);
       });
     },
   );
