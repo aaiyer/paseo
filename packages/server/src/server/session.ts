@@ -7309,7 +7309,7 @@ export class Session {
     this.checkoutSession.cleanup();
 
     this.workspaceGitObserver.dispose();
-    this.workspaceFilesSession.dispose();
+    await this.workspaceFilesSession.dispose();
   }
 }
 

@@ -36,7 +36,10 @@ import {
 } from "../../test-utils/workspace-git-service-stub.js";
 import { expandTilde } from "../../../utils/path.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
-import { openMayaRestrictedWorkspaceAuthority } from "../../maya-restricted-mode.js";
+import {
+  openMayaRestrictedWorkspaceAuthority,
+  type MayaRestrictedWorkspaceAuthority,
+} from "../../maya-restricted-mode.js";
 
 function isCheckDetailsResponse(msg: SessionOutboundMessage): boolean {
   return msg.type === "checkout.forge.get_check_details.response";
@@ -650,6 +653,66 @@ describe("CheckoutSession", () => {
       });
 
       expect(subscriptions).toHaveLength(2);
+      expect(subscriptions[0].unsubscribeCalls).toBe(1);
+      expect(subscriptions[1].unsubscribeCalls).toBe(0);
+    });
+
+    it("suppresses an old diff update when resubscription wins during authority validation", async () => {
+      const { subscriber, subscriptions } = createFakeDiffSubscriber({
+        cwd: "/repo",
+        files: [],
+        error: null,
+      });
+      let validationStarted: (() => void) | undefined;
+      const atValidation = new Promise<void>((resolve) => {
+        validationStarted = resolve;
+      });
+      let finishValidation: (() => void) | undefined;
+      const validation = new Promise<boolean>((resolve) => {
+        finishValidation = () => resolve(true);
+      });
+      const authority = {
+        cwd: "/repo",
+        workspaceId: "workspace",
+        rootAccessPath: "/repo",
+        retain: () => authority,
+        release: vi.fn(async () => undefined),
+        isCurrent: vi
+          .fn()
+          .mockResolvedValueOnce(true)
+          .mockImplementationOnce(() => {
+            validationStarted?.();
+            return validation;
+          }),
+      } as unknown as MayaRestrictedWorkspaceAuthority;
+      const { checkout, emitted } = makeCheckoutSession({ diff: subscriber });
+      await checkout.handleSubscribeDiffRequest(
+        {
+          type: "subscribe_checkout_diff_request",
+          subscriptionId: "shared",
+          cwd: "/repo",
+          compare: { mode: "uncommitted" },
+          requestId: "old",
+        },
+        authority,
+      );
+      subscriptions[0].emit({
+        cwd: "/repo",
+        files: [{ path: "stale.txt", additions: 1, deletions: 0, status: "modified" }],
+        error: null,
+      });
+      await atValidation;
+      await checkout.handleSubscribeDiffRequest({
+        type: "subscribe_checkout_diff_request",
+        subscriptionId: "shared",
+        cwd: "/repo",
+        compare: { mode: "uncommitted" },
+        requestId: "new",
+      });
+      finishValidation?.();
+      await Promise.resolve();
+
+      expect(emitted.filter((message) => message.type === "checkout_diff_update")).toEqual([]);
       expect(subscriptions[0].unsubscribeCalls).toBe(1);
       expect(subscriptions[1].unsubscribeCalls).toBe(0);
     });

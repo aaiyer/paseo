@@ -39,6 +39,9 @@ import { terminalSubscriptionKey } from "@getpaseo/protocol/terminal-subscriptio
 import type { MayaRestrictedWorkspaceAuthority } from "../server/maya-restricted-mode.js";
 
 const MAX_TERMINAL_STREAM_SLOTS = 256;
+const MAX_RESTRICTED_PENDING_BINARY_FRAMES = 64;
+export const MAYA_RESTRICTED_TERMINAL_AUTHORITY_DIAGNOSTIC =
+  "maya_restricted_terminal_authority_drift";
 
 interface BufferedTerminalOutput {
   data: string;
@@ -166,6 +169,8 @@ export class TerminalSessionController {
   private nextSlot = 0;
   private nextStreamGeneration = 1;
   private nextDirectoryGeneration = 1;
+  private restrictedBinaryTail: Promise<void> = Promise.resolve();
+  private restrictedPendingBinaryFrames = 0;
 
   constructor(options: TerminalSessionControllerOptions) {
     this.terminalManager = options.terminalManager;
@@ -238,6 +243,42 @@ export class TerminalSessionController {
   }
 
   async handleBinaryFrame(frame: TerminalStreamFrame, mayaRestrictedMode = false): Promise<void> {
+    if (!mayaRestrictedMode) {
+      await this.processBinaryFrame(frame, false);
+      return;
+    }
+    if (this.restrictedPendingBinaryFrames >= MAX_RESTRICTED_PENDING_BINARY_FRAMES) {
+      const activeStream = this.activeStreams.get(frame.slot);
+      const terminal = activeStream
+        ? this.terminalManager?.getTerminal(activeStream.terminalId)
+        : undefined;
+      if (terminal) {
+        await this.terminateRestrictedTerminalAndWait(
+          terminal,
+          "Terminal input authority queue exceeded its bound",
+        );
+      }
+      return;
+    }
+    this.restrictedPendingBinaryFrames += 1;
+    const operation = this.restrictedBinaryTail.then(() => this.processBinaryFrame(frame, true));
+    this.restrictedBinaryTail = operation
+      .catch((error) => {
+        this.sessionLogger.warn(
+          { err: error },
+          "Failed to process restricted terminal binary frame",
+        );
+      })
+      .finally(() => {
+        this.restrictedPendingBinaryFrames -= 1;
+      });
+    await operation;
+  }
+
+  private async processBinaryFrame(
+    frame: TerminalStreamFrame,
+    mayaRestrictedMode: boolean,
+  ): Promise<void> {
     const activeStream = this.activeStreams.get(frame.slot);
     if (!activeStream || !this.terminalManager) {
       return;
@@ -405,6 +446,16 @@ export class TerminalSessionController {
     terminal: TerminalSession,
     reason: string,
   ): Promise<string> {
+    this.sessionLogger.warn(
+      {
+        event: MAYA_RESTRICTED_TERMINAL_AUTHORITY_DIAGNOSTIC,
+        terminalId: terminal.id,
+        cwd: terminal.cwd,
+        workspaceId: terminal.workspaceId,
+        reason,
+      },
+      "Maya restricted terminal authority drifted; terminating terminal",
+    );
     this.detachStream(terminal.id, { emitExit: true });
     await this.terminalManager?.killTerminalAndWait(terminal.id);
     const authority = this.restrictedTerminalAuthorities.get(terminal.id);

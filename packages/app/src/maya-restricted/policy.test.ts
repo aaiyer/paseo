@@ -6,6 +6,7 @@ import {
   isMayaRestrictedServerInfo,
   isMayaRestrictedShortcutActionAllowed,
   resolveMayaRestrictedAppComposition,
+  resolveMayaRestrictedRoutedServer,
   resolveMayaRestrictedRouteRedirect,
 } from "./policy";
 
@@ -195,5 +196,20 @@ describe("Maya restricted app policy", () => {
         restrictedServerIds: ["maya"],
       }),
     ).toBe("/h/maya");
+  });
+
+  test("uses only the routed server for global and mixed-server sidebar composition", () => {
+    const serverInfoById = {
+      ordinary: { serverId: "ordinary", hostname: null, version: null },
+      maya: {
+        serverId: "maya",
+        hostname: null,
+        version: null,
+        profile: "maya-restricted" as const,
+      },
+    };
+    expect(resolveMayaRestrictedRoutedServer(null, serverInfoById)).toBe(false);
+    expect(resolveMayaRestrictedRoutedServer("ordinary", serverInfoById)).toBe(false);
+    expect(resolveMayaRestrictedRoutedServer("maya", serverInfoById)).toBe(true);
   });
 });

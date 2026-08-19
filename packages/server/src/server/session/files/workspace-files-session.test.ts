@@ -90,6 +90,51 @@ function uploadFrame(args: Parameters<typeof encodeFileTransferFrame>[0]): FileT
 }
 
 describe("WorkspaceFilesSession", () => {
+  test("dispose awaits observer cleanup and retained workspace authority release", async () => {
+    const observerUnsubscribe = vi.fn();
+    let finishRelease: (() => void) | undefined;
+    const releaseFinished = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    const authority = {
+      cwd: "/work/repo",
+      workspaceId: "workspace",
+      rootAccessPath: makeDir("workspace-files-dispose-authority-"),
+      retain: () => authority,
+      release: vi.fn(() => releaseFinished),
+      isCurrent: vi.fn(async () => true),
+    } as unknown as MayaRestrictedWorkspaceAuthority;
+    const fileObserver = {
+      subscribe: vi.fn(async () => ({
+        initial: { status: "missing" as const, cwd: authority.cwd, path: "notes.txt" },
+        unsubscribe: observerUnsubscribe,
+      })),
+    } as unknown as FileObserver;
+    const { subsystem } = makeSubsystem({ fileObserver });
+    await subsystem.handleFileSubscribeRequest(
+      {
+        type: "fs.file.subscribe.request",
+        cwd: authority.cwd,
+        path: "notes.txt",
+        subscriptionId: "dispose",
+        requestId: "subscribe",
+      },
+      authority,
+    );
+
+    let disposed = false;
+    const disposal = subsystem.dispose().then(() => {
+      disposed = true;
+    });
+    await Promise.resolve();
+    expect(observerUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(authority.release).toHaveBeenCalledTimes(1);
+    expect(disposed).toBe(false);
+    finishRelease?.();
+    await disposal;
+    expect(disposed).toBe(true);
+  });
+
   test("reserves a subscription id before observer creation and disposes a late superseded observer", async () => {
     type ObserverSubscription = Awaited<ReturnType<FileObserver["subscribe"]>>;
     const pending: Array<(subscription: ObserverSubscription) => void> = [];

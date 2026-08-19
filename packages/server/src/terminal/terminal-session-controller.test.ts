@@ -9,7 +9,10 @@ import {
 } from "@getpaseo/protocol/binary-frames/index";
 import type { TerminalCell, TerminalState } from "@getpaseo/protocol/messages";
 import type { ServerMessage, TerminalSession, TerminalStateSnapshot } from "./terminal.js";
-import { TerminalSessionController } from "./terminal-session-controller.js";
+import {
+  MAYA_RESTRICTED_TERMINAL_AUTHORITY_DIAGNOSTIC,
+  TerminalSessionController,
+} from "./terminal-session-controller.js";
 import type { TerminalManager, TerminalsChangedEvent } from "./terminal-manager.js";
 import { isSameOrDescendantPath } from "../server/path-utils.js";
 import { PluginSessionSocket } from "../server/plugins/session-socket.js";
@@ -385,13 +388,14 @@ describe("terminal-session-controller legacy terminal creation", () => {
       },
       isCurrent: async () => current,
     };
+    const logger = createLogger();
     const controller = new TerminalSessionController({
       terminalManager,
       emit: vi.fn(),
       emitBinary: vi.fn(),
       hasBinaryChannel: () => true,
       isPathWithinRoot: isSameOrDescendantPath,
-      sessionLogger: createLogger(),
+      sessionLogger: logger,
       listTerminalWorkspaceRefs: async () => [{ workspaceId, cwd }],
       acquireMayaRestrictedWorkspaceAuthority: async () => authority.retain(),
     });
@@ -459,8 +463,169 @@ describe("terminal-session-controller legacy terminal creation", () => {
       await controller.dispatch(request, { mayaRestrictedMode: true });
     }
     expect(killTerminalAndWait).toHaveBeenCalledTimes(5);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: MAYA_RESTRICTED_TERMINAL_AUTHORITY_DIAGNOSTIC,
+        terminalId: terminal.id,
+      }),
+      "Maya restricted terminal authority drifted; terminating terminal",
+    );
     expect(references).toBe(1);
     controller.dispose();
+  });
+
+  test("serializes restricted binary validation and PTY input in FIFO order", async () => {
+    const cwd = "/work/repo";
+    const terminal = listSession({ id: "term-ordered", name: "Shell", cwd, workspaceId: "ws" });
+    const manager = {
+      createTerminal: vi.fn(async () => terminal),
+      getTerminal: vi.fn(() => terminal),
+      getTerminalState: vi.fn(async () => ({ state: terminalState(""), revision: 0 })),
+      killTerminalAndWait: vi.fn(),
+    } as unknown as TerminalManager;
+    let validationCount = 0;
+    let measureBinaryValidations = false;
+    let activeValidations = 0;
+    let peakValidations = 0;
+    const gates: Array<ReturnType<typeof deferred<boolean>>> = [];
+    const authority: MayaRestrictedWorkspaceAuthority = {
+      cwd,
+      workspaceId: "ws",
+      rootAccessPath: "/proc/self/fd/7",
+      terminalSandboxBinding: async () => ({ workspaceRoot: cwd, rootDevice: 1n, rootInode: 2n }),
+      retain() {
+        return this;
+      },
+      release: async () => {},
+      isCurrent: async () => {
+        validationCount += 1;
+        if (!measureBinaryValidations) return true;
+        activeValidations += 1;
+        peakValidations = Math.max(peakValidations, activeValidations);
+        const gate = deferred<boolean>();
+        gates.push(gate);
+        try {
+          return await gate.promise;
+        } finally {
+          activeValidations -= 1;
+        }
+      },
+    };
+    const emitBinary = vi.fn();
+    const controller = new TerminalSessionController({
+      terminalManager: manager,
+      emit: vi.fn(),
+      emitBinary,
+      hasBinaryChannel: () => true,
+      isPathWithinRoot: isSameOrDescendantPath,
+      sessionLogger: createLogger(),
+    });
+    await controller.dispatch(
+      { type: "create_terminal_request", cwd, workspaceId: "ws", requestId: "create" },
+      { mayaRestrictedMode: true, workspaceAuthority: authority },
+    );
+    await controller.dispatch({
+      type: "subscribe_terminal_request",
+      terminalId: terminal.id,
+      requestId: "subscribe",
+    });
+    await vi.waitFor(() => expect(emitBinary).toHaveBeenCalled());
+    measureBinaryValidations = true;
+    const internals = controller as unknown as { activeStreams: Map<number, unknown> };
+    const slot = [...internals.activeStreams.keys()][0]!;
+    const sends = ["one", "two", "three"].map((text) =>
+      controller.handleBinaryFrame(
+        {
+          opcode: TerminalStreamOpcode.Input,
+          slot,
+          payload: new TextEncoder().encode(text),
+        },
+        true,
+      ),
+    );
+    for (let index = 0; index < sends.length; index += 1) {
+      await vi.waitFor(() => expect(gates).toHaveLength(index + 1));
+      gates[index]?.resolve(true);
+    }
+    await Promise.all(sends);
+
+    expect(peakValidations).toBe(1);
+    expect(terminal.send).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(terminal.send).mock.calls.map(([message]) => message)).toEqual([
+      { type: "input", data: "one" },
+      { type: "input", data: "two" },
+      { type: "input", data: "three" },
+    ]);
+  });
+
+  test("bounds a restricted binary burst and terminates before queued input can pass", async () => {
+    const cwd = "/work/repo";
+    const terminal = listSession({ id: "term-bounded", name: "Shell", cwd, workspaceId: "ws" });
+    const validation = deferred<boolean>();
+    let admitted = true;
+    const authority: MayaRestrictedWorkspaceAuthority = {
+      cwd,
+      workspaceId: "ws",
+      rootAccessPath: "/proc/self/fd/7",
+      terminalSandboxBinding: async () => ({ workspaceRoot: cwd, rootDevice: 1n, rootInode: 2n }),
+      retain() {
+        return this;
+      },
+      release: async () => {},
+      isCurrent: async () => (admitted ? true : validation.promise),
+    };
+    const killTerminalAndWait = vi.fn(async () => undefined);
+    const manager = {
+      createTerminal: vi.fn(async () => terminal),
+      getTerminal: vi.fn(() => terminal),
+      getTerminalState: vi.fn(async () => ({ state: terminalState(""), revision: 0 })),
+      killTerminalAndWait,
+    } as unknown as TerminalManager;
+    const logger = createLogger();
+    const emitBinary = vi.fn();
+    const controller = new TerminalSessionController({
+      terminalManager: manager,
+      emit: vi.fn(),
+      emitBinary,
+      hasBinaryChannel: () => true,
+      isPathWithinRoot: isSameOrDescendantPath,
+      sessionLogger: logger,
+    });
+    await controller.dispatch(
+      { type: "create_terminal_request", cwd, workspaceId: "ws", requestId: "create" },
+      { mayaRestrictedMode: true, workspaceAuthority: authority },
+    );
+    await controller.dispatch({
+      type: "subscribe_terminal_request",
+      terminalId: terminal.id,
+      requestId: "subscribe",
+    });
+    await vi.waitFor(() => expect(emitBinary).toHaveBeenCalled());
+    admitted = false;
+    const internals = controller as unknown as { activeStreams: Map<number, unknown> };
+    const slot = [...internals.activeStreams.keys()][0]!;
+    const burst = Array.from({ length: 65 }, (_, index) =>
+      controller.handleBinaryFrame(
+        {
+          opcode: TerminalStreamOpcode.Input,
+          slot,
+          payload: new TextEncoder().encode(String(index)),
+        },
+        true,
+      ),
+    );
+    await vi.waitFor(() => expect(killTerminalAndWait).toHaveBeenCalledWith(terminal.id));
+    validation.resolve(true);
+    await Promise.all(burst);
+
+    expect(terminal.send).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: MAYA_RESTRICTED_TERMINAL_AUTHORITY_DIAGNOSTIC,
+        reason: "Terminal input authority queue exceeded its bound",
+      }),
+      "Maya restricted terminal authority drifted; terminating terminal",
+    );
   });
 
   test("resolves a missing workspaceId from the active workspace root", async () => {

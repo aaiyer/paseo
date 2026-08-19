@@ -99,7 +99,9 @@ export const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
 export const MAX_DIRECTORY_ENTRIES = 1024;
 export const DIRECTORY_ENTRY_OPEN_CONCURRENCY = 16;
 const READ_FILE_OPEN_FLAGS =
-  process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
+  process.platform === "win32"
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const READ_DIRECTORY_OPEN_FLAGS =
   process.platform === "win32"
     ? constants.O_RDONLY

@@ -440,9 +440,13 @@ export class CheckoutSession {
         { cwd, compare: msg.compare, signal: abort.signal },
         (snapshot) => {
           void (async () => {
+            const generationIsCurrent =
+              this.diffSubscriptions.get(msg.subscriptionId) === unsubscribe;
+            const authorityIsCurrent = !retainedAuthority || (await retainedAuthority.isCurrent());
             if (
-              this.diffSubscriptions.get(msg.subscriptionId) !== unsubscribe ||
-              (retainedAuthority && !(await retainedAuthority.isCurrent()))
+              !generationIsCurrent ||
+              !authorityIsCurrent ||
+              this.diffSubscriptions.get(msg.subscriptionId) !== unsubscribe
             ) {
               unsubscribe();
               if (this.diffSubscriptions.get(msg.subscriptionId) === unsubscribe) {
@@ -464,6 +468,11 @@ export class CheckoutSession {
 
       if (retainedAuthority && !(await retainedAuthority.isCurrent())) {
         throw new Error("workspace authority changed while opening diff subscription");
+      }
+
+      if (this.diffSubscriptions.get(msg.subscriptionId) !== unsubscribe) {
+        unsubscribe();
+        return;
       }
 
       this.host.emit({

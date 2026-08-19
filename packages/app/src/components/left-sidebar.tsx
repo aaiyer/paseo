@@ -78,7 +78,7 @@ import { SidebarAgentListSkeleton } from "./sidebar-agent-list-skeleton";
 import { SidebarCalloutSlot } from "./sidebar-callout-slot";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { PluginSidebarItems } from "@/plugins";
-import { isMayaRestrictedServerInfo } from "@/maya-restricted/policy";
+import { useMayaRestrictedRoutedServer } from "@/maya-restricted/use-routed-profile";
 
 type SidebarTheme = ReturnType<typeof useUnistyles>["theme"];
 
@@ -142,14 +142,7 @@ export const LeftSidebar = memo(function LeftSidebar({ active }: { active: boole
   const isCompactLayout = useIsCompactFormFactor();
   const showMobileAgent = usePanelStore((state) => state.showMobileAgent);
   const pathname = usePathname();
-  const routeServerId = parseServerIdFromPathname(pathname);
-  const mayaRestricted = useSessionStore((state) =>
-    routeServerId
-      ? isMayaRestrictedServerInfo(state.sessions[routeServerId]?.serverInfo)
-      : Object.values(state.sessions).some((session) =>
-          isMayaRestrictedServerInfo(session?.serverInfo),
-        ),
-  );
+  const mayaRestricted = useMayaRestrictedRoutedServer();
 
   const {
     projects,

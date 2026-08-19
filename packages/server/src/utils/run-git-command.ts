@@ -30,6 +30,12 @@ const DEFAULT_STDERR_LIMIT = 2048;
 const MAYA_ROOT_CHILD_FD = 3;
 const MAYA_GIT_DIRECTORY_CHILD_FD = 4;
 const MAYA_COMMON_DIRECTORY_CHILD_FD = 5;
+const MAYA_RESTRICTED_GIT_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  ["core.fsmonitor", "false"],
+  ["core.hooksPath", "/dev/null"],
+  ["diff.trustExitCode", "false"],
+  ["credential.helper", ""],
+];
 
 let gitProcessScheduler = new GitProcessScheduler(resolveGitProcessPolicy({ env: process.env }));
 let gitRuntimeMetrics = createGitCommandRuntimeMetricsWindow(gitProcessScheduler.policy);
@@ -276,6 +282,9 @@ export function runGitCommand(
 ): Promise<GitCommandResult> {
   const authority = resolveMayaRestrictedWorkspaceAuthorityBinding(options.cwd);
   if (!authority) return runGitCommandWithBoundOptions(args, options);
+  if (args.includes("--textconv") || args.includes("--ext-diff")) {
+    return Promise.reject(new Error("Maya restricted Git executable diff helpers are disabled"));
+  }
   return authority.validateGitAssociation().then(async () => {
     const hook = afterMayaAuthorityValidationForTest;
     afterMayaAuthorityValidationForTest = null;
@@ -283,7 +292,9 @@ export function runGitCommand(
     if (!authority.gitLaunchContext) {
       throw new Error("Maya restricted Git launch context is absent");
     }
-    return runGitCommandWithBoundOptions(args, options, authority.gitLaunchContext);
+    const restrictedArgs =
+      args[0] === "diff" ? [args[0], "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
+    return runGitCommandWithBoundOptions(restrictedArgs, options, authority.gitLaunchContext);
   });
 }
 
@@ -314,11 +325,27 @@ function runGitCommandWithBoundOptions(
       const acceptExitCodes = options.acceptExitCodes ?? [0];
       const command = formatGitCommand(args);
       const mayaGitEnvironment: ProcessEnvRecord | undefined = mayaLaunchContext
-        ? {
-            GIT_WORK_TREE: `/proc/self/fd/${MAYA_ROOT_CHILD_FD}`,
-            GIT_DIR: `/proc/self/fd/${MAYA_GIT_DIRECTORY_CHILD_FD}`,
-            GIT_COMMON_DIR: `/proc/self/fd/${MAYA_COMMON_DIRECTORY_CHILD_FD}`,
-          }
+        ? Object.assign(
+            {
+              GIT_WORK_TREE: `/proc/self/fd/${MAYA_ROOT_CHILD_FD}`,
+              GIT_DIR: `/proc/self/fd/${MAYA_GIT_DIRECTORY_CHILD_FD}`,
+              GIT_COMMON_DIR: `/proc/self/fd/${MAYA_COMMON_DIRECTORY_CHILD_FD}`,
+              GIT_CONFIG_NOSYSTEM: "1",
+              GIT_CONFIG_GLOBAL: "/dev/null",
+              GIT_ATTR_NOSYSTEM: "1",
+              GIT_OPTIONAL_LOCKS: "0",
+              GIT_TERMINAL_PROMPT: "0",
+              GIT_PAGER: "cat",
+              PAGER: "cat",
+              GIT_CONFIG_COUNT: String(MAYA_RESTRICTED_GIT_CONFIG.length),
+            },
+            Object.fromEntries(
+              MAYA_RESTRICTED_GIT_CONFIG.flatMap(([key, value], index) => [
+                [`GIT_CONFIG_KEY_${index}`, key],
+                [`GIT_CONFIG_VALUE_${index}`, value],
+              ]),
+            ),
+          )
         : undefined;
       const envOverlay = mergeEnvOverlays(
         mergeEnvOverlays(options.env, options.envOverlay),

@@ -6,7 +6,12 @@ import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { getDownloadableFileInfo, listDirectoryEntries, readExplorerFile } from "./service.js";
+import {
+  getDownloadableFileInfo,
+  listDirectoryEntries,
+  readExplorerFile,
+  streamExplorerFile,
+} from "./service.js";
 import { isPlatform } from "../../test-utils/platform.js";
 
 const execFileAsync = promisify(execFile);
@@ -95,6 +100,25 @@ describe.skipIf(isPlatform("win32"))("service POSIX-only", () => {
       ]);
       for (const listing of listings) {
         expect(listing.entries.map((entry) => entry.name)).toEqual(["visible.txt"]);
+      }
+      const directReads = Array.from({ length: 16 }, () =>
+        readExplorerFile({ root, relativePath: "blocked.fifo" }),
+      );
+      const streamReads = Array.from({ length: 16 }, () =>
+        streamExplorerFile({ root, relativePath: "blocked.fifo" }, async () => undefined),
+      );
+      const results = await Promise.race([
+        Promise.allSettled([...directReads, ...streamReads]),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("FIFO read blocked the event loop")), 1_000),
+        ),
+      ]);
+      expect(results).toHaveLength(32);
+      for (const result of results) {
+        expect(result.status).toBe("rejected");
+        if (result.status === "rejected") {
+          expect(String(result.reason)).toContain("Requested path is not a file");
+        }
       }
     } finally {
       await rm(root, { recursive: true, force: true });

@@ -137,6 +137,7 @@ import {
   resolveMayaRestrictedAppComposition,
   resolveMayaRestrictedRouteRedirect,
 } from "@/maya-restricted/policy";
+import { useMayaRestrictedRoutedServer } from "@/maya-restricted/use-routed-profile";
 import {
   ensureOsNotificationPermission,
   WEB_NOTIFICATION_CLICK_EVENT,
@@ -477,14 +478,6 @@ interface AppContainerProps {
 }
 
 const WINDOW_SIDEBAR_TOGGLE_HORIZONTAL_PADDING = 12;
-
-function useMayaRestrictedRoutedServer(): boolean {
-  const pathname = usePathname();
-  const routeServerId = useMemo(() => parseServerIdFromPathname(pathname), [pathname]);
-  return useSessionStore((state) =>
-    routeServerId ? isMayaRestrictedServerInfo(state.sessions[routeServerId]?.serverInfo) : false,
-  );
-}
 
 function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppContainerProps) {
   const keyboardActionDispatcher = useKeyboardActionDispatcher();

@@ -80,7 +80,7 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
-  test("keeps Maya's committed catalog immutable while a provider starts", async () => {
+  test("keeps Maya's committed catalog immutable and avoids fetch through the real websocket session", async () => {
     const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-maya-catalog-"));
     const paseoHome = path.join(paseoHomeRoot, ".paseo");
     const projectsDir = path.join(paseoHome, "projects");
@@ -89,6 +89,38 @@ describe("paseo daemon bootstrap", () => {
     await mkdir(projectsDir, { recursive: true });
     await mkdir(repository, { recursive: true });
     await runGitCommand(["init", "-q", "-b", "main"], { cwd: repository });
+    await runGitCommand(
+      [
+        "-c",
+        "user.name=Paseo Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "initial",
+      ],
+      { cwd: repository },
+    );
+
+    let remoteRequests = 0;
+    const remote = http.createServer((_request, response) => {
+      remoteRequests += 1;
+      response.writeHead(401);
+      response.end();
+    });
+    await new Promise<void>((resolve, reject) => {
+      remote.once("error", reject);
+      remote.listen(0, "127.0.0.1", resolve);
+    });
+    const remoteAddress = remote.address();
+    if (!remoteAddress || typeof remoteAddress === "string") {
+      throw new Error("Expected test Git remote to bind a TCP port");
+    }
+    await runGitCommand(
+      ["remote", "add", "origin", `http://127.0.0.1:${remoteAddress.port}/repository.git`],
+      { cwd: repository },
+    );
 
     const projectPath = path.join(projectsDir, "projects.json");
     const workspacePath = path.join(projectsDir, "workspaces.json");
@@ -160,10 +192,22 @@ describe("paseo daemon bootstrap", () => {
       speech: undefined,
     };
     const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
+    let client: DaemonClient | null = null;
 
     try {
       await daemon.start();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const target = daemon.getListenTarget();
+      if (!target || target.type !== "tcp") throw new Error("Expected a TCP listener");
+      client = new DaemonClient({
+        url: `ws://127.0.0.1:${target.port}/ws`,
+        appVersion: "0.4.0",
+      });
+      await client.connect();
+      const response = await client.fetchWorkspaces({ requestId: "restricted-real-session" });
+      expect(response.entries.map((workspace) => workspace.id)).toContain("workspace-maya");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(remoteRequests).toBe(0);
+
       const agent = await daemon.agentManager.createAgent(
         { provider: "codex", cwd: repository },
         undefined,
@@ -178,8 +222,10 @@ describe("paseo daemon bootstrap", () => {
         ]),
       ).toEqual([projectBytes, workspaceBytes, generationBytes]);
     } finally {
+      await client?.close().catch(() => undefined);
       await daemon.stop().catch(() => undefined);
       await daemon.agentManager.flush().catch(() => undefined);
+      await new Promise<void>((resolve) => remote.close(() => resolve()));
       await Promise.all([
         rm(paseoHomeRoot, { recursive: true, force: true }),
         rm(staticDir, { recursive: true, force: true }),

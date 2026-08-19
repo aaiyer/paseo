@@ -45,6 +45,13 @@ export function isMayaRestrictedServerInfo(
   return serverInfo?.profile === MAYA_RESTRICTED_PROFILE;
 }
 
+export function resolveMayaRestrictedRoutedServer(
+  routeServerId: string | null,
+  serverInfoById: Readonly<Record<string, DaemonServerInfo | null | undefined>>,
+): boolean {
+  return routeServerId !== null && isMayaRestrictedServerInfo(serverInfoById[routeServerId]);
+}
+
 export function filterMayaRestrictedCommandRegistration(
   registration: CommandCenterRegistration,
 ): CommandCenterRegistration {
