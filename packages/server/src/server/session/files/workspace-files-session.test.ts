@@ -87,6 +87,56 @@ function uploadFrame(args: Parameters<typeof encodeFileTransferFrame>[0]): FileT
 }
 
 describe("WorkspaceFilesSession", () => {
+  test("reserves a subscription id before observer creation and disposes a late superseded observer", async () => {
+    type ObserverSubscription = Awaited<ReturnType<FileObserver["subscribe"]>>;
+    const pending: Array<(subscription: ObserverSubscription) => void> = [];
+    const fileObserver = {
+      subscribe: vi.fn(
+        () =>
+          new Promise<ObserverSubscription>((resolve) => {
+            pending.push(resolve);
+          }),
+      ),
+    } as unknown as FileObserver;
+    const firstUnsubscribe = vi.fn();
+    const secondUnsubscribe = vi.fn();
+    const cwd = makeDir("workspace-files-subscription-race-");
+    const { subsystem, emitted } = makeSubsystem({ fileObserver });
+    const request = {
+      type: "fs.file.subscribe.request" as const,
+      cwd,
+      path: "notes.txt",
+      subscriptionId: "shared-subscription",
+    };
+
+    const first = subsystem.handleFileSubscribeRequest({ ...request, requestId: "first" });
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    const second = subsystem.handleFileSubscribeRequest({ ...request, requestId: "second" });
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+
+    pending[1]?.({
+      initial: { status: "missing", cwd, path: "notes.txt" },
+      unsubscribe: secondUnsubscribe,
+    });
+    await second;
+    pending[0]?.({
+      initial: { status: "missing", cwd, path: "notes.txt" },
+      unsubscribe: firstUnsubscribe,
+    });
+    await first;
+
+    expect(firstUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(secondUnsubscribe).not.toHaveBeenCalled();
+    expect(emitted).toEqual([
+      expect.objectContaining({
+        type: "fs.file.subscribe.response",
+        payload: expect.objectContaining({ requestId: "second" }),
+      }),
+    ]);
+    subsystem.dispose();
+    expect(secondUnsubscribe).toHaveBeenCalledTimes(1);
+  });
+
   test("creates an entry and emits the complete success response", async () => {
     const cwd = makeDir("workspace-files-create-");
     const { subsystem, emitted } = makeSubsystem();

@@ -96,6 +96,8 @@ const DEFAULT_TEXT_MIME_TYPE = "text/plain";
 const FILE_TYPE_SAMPLE_BYTES = 8192;
 export const FILE_EXPLORER_STREAM_CHUNK_BYTES = 256 * 1024;
 export const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
+export const MAX_DIRECTORY_ENTRIES = 1024;
+export const DIRECTORY_ENTRY_OPEN_CONCURRENCY = 16;
 const READ_FILE_OPEN_FLAGS =
   process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
 const READ_DIRECTORY_OPEN_FLAGS =
@@ -104,6 +106,8 @@ const READ_DIRECTORY_OPEN_FLAGS =
     : constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const ACCESS_OUTSIDE_WORKSPACE_MESSAGE = "Access outside of workspace is not allowed";
 let beforeScopedReadOpenForTest: (() => Promise<void>) | null = null;
+let directoryEntryOpenHookForTest: ((phase: "opened" | "closed") => Promise<void> | void) | null =
+  null;
 
 /** Deterministic race seam for production read-path regression tests only. */
 export function installFileExplorerBeforeReadOpenHookForTest(
@@ -116,6 +120,22 @@ export function installFileExplorerBeforeReadOpenHookForTest(
   beforeScopedReadOpenForTest = hook;
   return () => {
     if (beforeScopedReadOpenForTest === hook) beforeScopedReadOpenForTest = null;
+  };
+}
+
+/** Deterministic entry-handle lifetime seam for bounded-concurrency regression tests only. */
+export function installDirectoryEntryOpenHookForTest(
+  hook: (phase: "opened" | "closed") => Promise<void> | void,
+): () => void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("directory entry open hook is test-only");
+  }
+  if (directoryEntryOpenHookForTest) {
+    throw new Error("directory entry open hook is already installed");
+  }
+  directoryEntryOpenHookForTest = hook;
+  return () => {
+    if (directoryEntryOpenHookForTest === hook) directoryEntryOpenHookForTest = null;
   };
 }
 
@@ -177,9 +197,14 @@ export async function listDirectoryEntries({
 
     const descriptorPath = descriptorPathFor(opened.handle);
     const dirents = await fs.readdir(descriptorPath, { withFileTypes: true });
+    if (dirents.length > MAX_DIRECTORY_ENTRIES) {
+      throw new Error(`Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`);
+    }
 
-    const entriesWithNulls = await Promise.all(
-      dirents.map(async (dirent) => {
+    const entriesWithNulls = await mapWithConcurrency(
+      dirents,
+      DIRECTORY_ENTRY_OPEN_CONCURRENCY,
+      async (dirent) => {
         const targetPath = path.join(opened.scoped.requestedPath, dirent.name);
         const kind: ExplorerEntryKind = dirent.isDirectory() ? "directory" : "file";
         try {
@@ -198,7 +223,7 @@ export async function listDirectoryEntries({
           }
           throw error;
         }
-      }),
+      },
     );
     const entries = entriesWithNulls.filter((entry): entry is FileExplorerEntry => entry !== null);
 
@@ -922,7 +947,13 @@ async function buildDescriptorBoundEntryPayload({
   kind,
 }: EntryPayloadParams & { descriptorPath: string }): Promise<FileExplorerEntry> {
   const handle = await fs.open(path.join(descriptorPath, name), constants.O_RDONLY);
+  let hookOpened = false;
   try {
+    const hook = directoryEntryOpenHookForTest;
+    if (hook) {
+      hookOpened = true;
+      await hook("opened");
+    }
     await validateOpenedPathWithinRoot(handle, root);
     const stats = await handle.stat();
     return {
@@ -934,7 +965,27 @@ async function buildDescriptorBoundEntryPayload({
     };
   } finally {
     await handle.close();
+    if (hookOpened) await directoryEntryOpenHookForTest?.("closed");
   }
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  map: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      results[index] = await map(values[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function isMissingEntryError(error: unknown): boolean {

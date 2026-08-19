@@ -14,6 +14,10 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { runGitCommand } from "../../utils/run-git-command.js";
 import {
+  DIRECTORY_ENTRY_OPEN_CONCURRENCY,
+  installDirectoryEntryOpenHookForTest,
+  listDirectoryEntries,
+  MAX_DIRECTORY_ENTRIES,
   createExplorerEntry,
   deleteExplorerEntry,
   duplicateExplorerEntry,
@@ -33,6 +37,67 @@ async function createTempDir(prefix: string): Promise<string> {
 }
 
 describe("file explorer service", () => {
+  it("bounds directory entry handles while preserving a supported listing", async () => {
+    const root = await createTempDir("paseo-file-list-bounded-");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reachedBound: (() => void) | undefined;
+    const atBound = new Promise<void>((resolve) => {
+      reachedBound = resolve;
+    });
+    let active = 0;
+    let peak = 0;
+    const uninstall = installDirectoryEntryOpenHookForTest(async (phase) => {
+      if (phase === "closed") {
+        active -= 1;
+        return;
+      }
+      active += 1;
+      peak = Math.max(peak, active);
+      if (active === DIRECTORY_ENTRY_OPEN_CONCURRENCY) reachedBound?.();
+      await gate;
+    });
+    try {
+      for (let index = 0; index < DIRECTORY_ENTRY_OPEN_CONCURRENCY * 3; index += 1) {
+        await writeFile(path.join(root, `entry-${index}.txt`), "fixture", "utf8");
+      }
+      const listing = listDirectoryEntries({ root });
+      await atBound;
+      expect(peak).toBe(DIRECTORY_ENTRY_OPEN_CONCURRENCY);
+      release?.();
+      const result = await listing;
+      expect(result.entries).toHaveLength(DIRECTORY_ENTRY_OPEN_CONCURRENCY * 3);
+      expect(active).toBe(0);
+      expect(peak).toBe(DIRECTORY_ENTRY_OPEN_CONCURRENCY);
+    } finally {
+      release?.();
+      uninstall();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized directory before opening any entry handle", async () => {
+    const root = await createTempDir("paseo-file-list-cap-");
+    let opened = 0;
+    const uninstall = installDirectoryEntryOpenHookForTest((phase) => {
+      if (phase === "opened") opened += 1;
+    });
+    try {
+      for (let index = 0; index <= MAX_DIRECTORY_ENTRIES; index += 1) {
+        await writeFile(path.join(root, `entry-${index}.txt`), "", "utf8");
+      }
+      await expect(listDirectoryEntries({ root })).rejects.toThrow(
+        `Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`,
+      );
+      expect(opened).toBe(0);
+    } finally {
+      uninstall();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("atomically writes an existing text file at the expected revision", async () => {
     const root = await createTempDir("paseo-file-write-");
     try {

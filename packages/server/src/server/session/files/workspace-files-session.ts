@@ -90,9 +90,12 @@ export class WorkspaceFilesSession {
     const unsubscribe = () => {
       if (!active) return;
       active = false;
-      observerUnsubscribe?.();
+      const observer = observerUnsubscribe;
+      observerUnsubscribe = null;
+      observer?.();
       void retainedAuthority?.release();
     };
+    this.fileSubscriptions.set(request.subscriptionId, unsubscribe);
     try {
       const subscription = await this.fileObserver.subscribe(
         { cwd: authority?.rootAccessPath ?? request.cwd, path: request.path },
@@ -119,10 +122,18 @@ export class WorkspaceFilesSession {
         },
       );
       observerUnsubscribe = subscription.unsubscribe;
+      if (!active || this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe) {
+        observerUnsubscribe();
+        observerUnsubscribe = null;
+        return;
+      }
       if (retainedAuthority && !(await retainedAuthority.isCurrent())) {
         throw new Error("workspace authority changed while opening file subscription");
       }
-      this.fileSubscriptions.set(request.subscriptionId, unsubscribe);
+      if (!active || this.fileSubscriptions.get(request.subscriptionId) !== unsubscribe) {
+        unsubscribe();
+        return;
+      }
       this.host.emit({
         type: "fs.file.subscribe.response",
         payload: {
@@ -132,7 +143,10 @@ export class WorkspaceFilesSession {
         },
       });
     } catch (error) {
+      const isCurrent = this.fileSubscriptions.get(request.subscriptionId) === unsubscribe;
       unsubscribe();
+      if (!isCurrent) return;
+      this.fileSubscriptions.delete(request.subscriptionId);
       this.host.emit({
         type: "fs.file.subscribe.response",
         payload: {
