@@ -62,6 +62,8 @@ const MAX_GIT_LINK_BYTES = 4096;
 const OPEN_DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const OPEN_FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW;
 let nextAuthorityCacheId = 1;
+const activeAuthorities = new Map<string, OpenMayaRestrictedWorkspaceAuthority>();
+const authorityOpenPromises = new Map<string, Promise<OpenMayaRestrictedWorkspaceAuthority>>();
 
 export interface MayaRestrictedWorkspaceAuthority {
   readonly cwd: string;
@@ -90,8 +92,10 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
     if (this.unregisterBinding) throw new Error("workspace authority is already active");
     const cacheId = nextAuthorityCacheId;
     nextAuthorityCacheId += 1;
-    this.unregisterBinding = registerMayaRestrictedWorkspaceAuthorityBinding(this.rootAccessPath, {
+    this.unregisterBinding = registerMayaRestrictedWorkspaceAuthorityBinding({
       cacheKey: `maya-restricted:${this.workspaceId}:${cacheId}`,
+      cwd: this.cwd,
+      rootAccessPath: this.rootAccessPath,
       gitLaunchContext: {
         rootHandle: this.rootHandle,
         gitDirectoryHandle: this.gitDirectoryHandle,
@@ -99,6 +103,7 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
       },
       validateGitAssociation: () => this.validateGitAssociation(),
     });
+    activeAuthorities.set(this.cwd, this);
   }
 
   retain(): MayaRestrictedWorkspaceAuthority {
@@ -113,6 +118,7 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
     if (this.references !== 0) return;
     this.unregisterBinding?.();
     this.unregisterBinding = null;
+    if (activeAuthorities.get(this.cwd) === this) activeAuthorities.delete(this.cwd);
     await closeUniqueHandles([
       this.rootHandle,
       this.dotGitHandle,
@@ -123,12 +129,8 @@ class OpenMayaRestrictedWorkspaceAuthority implements MayaRestrictedWorkspaceAut
 
   async isCurrent(): Promise<boolean> {
     try {
-      const current = await openMayaRestrictedWorkspaceAuthority(this.cwd);
-      try {
-        return current.workspaceId === this.workspaceId;
-      } finally {
-        await current.release();
-      }
+      await this.validateGitAssociation();
+      return true;
     } catch {
       return false;
     }
@@ -315,9 +317,9 @@ export function isMayaRestrictedWorkspaceReadRequest(
 }
 
 /** Opens and binds the exact host-catalog identity used by downstream readers. */
-export async function openMayaRestrictedWorkspaceAuthority(
+async function openFreshMayaRestrictedWorkspaceAuthority(
   cwd: string,
-): Promise<MayaRestrictedWorkspaceAuthority> {
+): Promise<OpenMayaRestrictedWorkspaceAuthority> {
   if (process.platform !== "linux") throw new Error("Maya restricted mode requires Linux");
   const expectedRoot = path.resolve(cwd);
   const rootHandle = await fs.open(expectedRoot, OPEN_DIRECTORY_FLAGS);
@@ -409,6 +411,40 @@ export async function openMayaRestrictedWorkspaceAuthority(
   } catch (error) {
     await closeUniqueHandles([rootHandle, dotGitHandle, gitDirectoryHandle, commonDirectoryHandle]);
     throw error;
+  }
+}
+
+export async function openMayaRestrictedWorkspaceAuthority(
+  cwd: string,
+): Promise<MayaRestrictedWorkspaceAuthority> {
+  const expectedRoot = path.resolve(cwd);
+  const existing = activeAuthorities.get(expectedRoot);
+  if (existing) {
+    existing.retain();
+    try {
+      await existing.validateGitAssociation();
+      return existing;
+    } catch (error) {
+      await existing.release();
+      throw error;
+    }
+  }
+
+  const pending = authorityOpenPromises.get(expectedRoot);
+  if (pending) {
+    const authority = await pending;
+    authority.retain();
+    return authority;
+  }
+
+  const opening = openFreshMayaRestrictedWorkspaceAuthority(expectedRoot);
+  authorityOpenPromises.set(expectedRoot, opening);
+  try {
+    return await opening;
+  } finally {
+    if (authorityOpenPromises.get(expectedRoot) === opening) {
+      authorityOpenPromises.delete(expectedRoot);
+    }
   }
 }
 

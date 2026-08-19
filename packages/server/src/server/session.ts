@@ -1807,6 +1807,7 @@ export class Session {
     msg: SessionInboundMessage,
     source?: object,
     workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null,
+    mayaRestrictedMode = false,
   ): Promise<void> {
     this.inflightRequests++;
     if (this.inflightRequests > this.peakInflightRequests) {
@@ -1836,7 +1837,7 @@ export class Session {
         return;
       }
       try {
-        await this.dispatchInboundMessage(msg, source, workspaceAuthority);
+        await this.dispatchInboundMessage(msg, source, workspaceAuthority, mayaRestrictedMode);
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
         this.sessionLogger.error({ err }, "Error handling message");
@@ -1882,6 +1883,7 @@ export class Session {
     msg: SessionInboundMessage,
     source?: object,
     workspaceAuthority?: MayaRestrictedWorkspaceAuthority | null,
+    mayaRestrictedMode = false,
   ): Promise<void> {
     const promise =
       this.dispatchVoiceAndControlMessage(msg) ??
@@ -1893,7 +1895,7 @@ export class Session {
       this.dispatchAgentConfigMessage(msg) ??
       this.dispatchCheckoutMessage(msg, workspaceAuthority) ??
       this.dispatchWorkspaceRecoveryMessage(msg) ??
-      this.dispatchWorkspaceAndProjectMessage(msg) ??
+      this.dispatchWorkspaceAndProjectMessage(msg, mayaRestrictedMode) ??
       this.dispatchWorkspaceFileMessage(msg, source, workspaceAuthority) ??
       this.dispatchProviderMessage(msg) ??
       this.dispatchOrchestrationSkillsMessage(msg) ??
@@ -2365,10 +2367,11 @@ export class Session {
 
   private dispatchWorkspaceAndProjectMessage(
     msg: SessionInboundMessage,
+    mayaRestrictedMode: boolean,
   ): Promise<void> | undefined {
     switch (msg.type) {
       case "fetch_workspaces_request":
-        return this.handleFetchWorkspacesRequest(msg);
+        return this.handleFetchWorkspacesRequest(msg, mayaRestrictedMode);
       case "project.list.request":
         return this.handleProjectListRequest(msg);
       case "paseo_worktree_list_request":
@@ -5408,6 +5411,7 @@ export class Session {
 
   private async handleFetchWorkspacesRequest(
     request: Extract<SessionInboundMessage, { type: "fetch_workspaces_request" }>,
+    mayaRestrictedMode: boolean,
   ): Promise<void> {
     const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
     const subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
@@ -5438,7 +5442,11 @@ export class Session {
       const payload = request.sync
         ? await this.readWorkspaceDirectorySync(request)
         : await this.listFetchWorkspacesEntries(request);
-      this.workspaceGitObserver.syncObservers(payload.entries);
+      if (mayaRestrictedMode) {
+        await this.workspaceGitObserver.syncMayaRestrictedObservers(payload.entries);
+      } else {
+        this.workspaceGitObserver.syncObservers(payload.entries);
+      }
       this.sessionLogger.debug(
         {
           requestId: request.requestId,

@@ -5,6 +5,10 @@ import type {
   WorkspaceGitRuntimeSnapshot,
   WorkspaceGitService,
 } from "../../workspace-git-service.js";
+import {
+  openMayaRestrictedWorkspaceAuthority,
+  type MayaRestrictedWorkspaceAuthority,
+} from "../../maya-restricted-mode.js";
 import type { PersistedWorkspaceRecord } from "../../workspace-registry.js";
 
 const WORKSPACE_GIT_WATCH_REMOVED_STATE_KEY = "__removed__";
@@ -39,6 +43,7 @@ export interface WorkspaceGitObserverMetrics {
  */
 export interface WorkspaceGitObserverService {
   syncObservers(workspaces: Iterable<WorkspaceDescriptorPayload>): void;
+  syncMayaRestrictedObservers(workspaces: Iterable<WorkspaceDescriptorPayload>): Promise<void>;
   syncObserverForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void>;
   warmGitData(workspace: PersistedWorkspaceRecord): Promise<void>;
   // Check-and-record dedupe gate: returns true when the descriptor state is unchanged
@@ -65,6 +70,7 @@ export function createWorkspaceGitObserverService(deps: {
     newBranch: string | null,
   ) => void;
   logger: pino.Logger;
+  openMayaRestrictedWorkspaceAuthority?: typeof openMayaRestrictedWorkspaceAuthority;
 }): WorkspaceGitObserverService {
   const {
     workspaceGitService,
@@ -75,10 +81,15 @@ export function createWorkspaceGitObserverService(deps: {
     onBranchChanged,
     logger,
   } = deps;
+  const openRestrictedAuthority =
+    deps.openMayaRestrictedWorkspaceAuthority ?? openMayaRestrictedWorkspaceAuthority;
 
   const watchTargets = new Map<string, WorkspaceGitWatchTarget>();
   const workspaceStates = new Map<string, WorkspaceGitWatchState>();
-  const subscriptions = new Map<string, () => void>();
+  const subscriptions = new Map<
+    string,
+    { unsubscribe: () => void; authority: MayaRestrictedWorkspaceAuthority | null }
+  >();
 
   function descriptorStateKey(workspace: WorkspaceDescriptorPayload | null): string {
     if (!workspace) {
@@ -112,8 +123,17 @@ export function createWorkspaceGitObserverService(deps: {
       workspaceStates.delete(workspaceId);
     }
     watchTargets.delete(normalizedCwd);
-    subscriptions.get(normalizedCwd)?.();
+    const subscription = subscriptions.get(normalizedCwd);
+    subscription?.unsubscribe();
     subscriptions.delete(normalizedCwd);
+    if (subscription?.authority) {
+      void subscription.authority.release().catch((error) => {
+        logger.warn(
+          { err: error, cwd: normalizedCwd },
+          "Failed to release Maya workspace observer authority",
+        );
+      });
+    }
   }
 
   function removeForWorkspaceId(workspaceId: string): void {
@@ -149,7 +169,11 @@ export function createWorkspaceGitObserverService(deps: {
     }
   }
 
-  function syncObserver(cwd: string, options: { isGit: boolean; workspaceId: string }): void {
+  function syncObserver(
+    cwd: string,
+    options: { isGit: boolean; workspaceId: string },
+    authority: MayaRestrictedWorkspaceAuthority | null = null,
+  ): void {
     const normalizedCwd = resolve(cwd);
     const currentState = workspaceStates.get(options.workspaceId);
     if (currentState && currentState.cwd !== normalizedCwd) {
@@ -174,12 +198,18 @@ export function createWorkspaceGitObserverService(deps: {
     }
 
     if (subscriptions.has(normalizedCwd)) {
+      if (authority) void authority.release();
       return;
     }
 
     let subscription: ReturnType<WorkspaceGitService["registerWorkspace"]>;
     try {
       subscription = workspaceGitService.registerWorkspace({ cwd: normalizedCwd }, (snapshot) => {
+        const currentSubscription = subscriptions.get(normalizedCwd);
+        if (currentSubscription?.authority) {
+          void emitRestrictedSnapshot(normalizedCwd, snapshot, currentSubscription);
+          return;
+        }
         handleBranchSnapshot(normalizedCwd, snapshot.git.currentBranch ?? null);
         void emitWorkspaceUpdateForCwd(normalizedCwd).catch((error) => {
           logger.warn(
@@ -191,9 +221,33 @@ export function createWorkspaceGitObserverService(deps: {
       });
     } catch (error) {
       removeForWorkspaceId(options.workspaceId);
+      if (authority) void authority.release();
       throw error;
     }
-    subscriptions.set(normalizedCwd, subscription.unsubscribe);
+    subscriptions.set(normalizedCwd, { unsubscribe: subscription.unsubscribe, authority });
+  }
+
+  async function emitRestrictedSnapshot(
+    cwd: string,
+    snapshot: WorkspaceGitRuntimeSnapshot,
+    subscription: {
+      unsubscribe: () => void;
+      authority: MayaRestrictedWorkspaceAuthority | null;
+    },
+  ): Promise<void> {
+    const authority = subscription.authority;
+    if (!authority || subscriptions.get(cwd) !== subscription) return;
+    if (!(await authority.isCurrent())) {
+      removeForCwd(cwd);
+      return;
+    }
+    handleBranchSnapshot(cwd, snapshot.git.currentBranch ?? null);
+    try {
+      await emitWorkspaceUpdateForCwd(cwd);
+    } catch (error) {
+      logger.warn({ err: error, cwd }, "Failed to emit workspace update after git branch snapshot");
+    }
+    if (subscriptions.get(cwd) === subscription) emitStatusUpdate(cwd, snapshot);
   }
 
   function syncObservers(workspaces: Iterable<WorkspaceDescriptorPayload>): void {
@@ -206,6 +260,41 @@ export function createWorkspaceGitObserverService(deps: {
     }
   }
 
+  async function syncMayaRestrictedObservers(
+    workspaces: Iterable<WorkspaceDescriptorPayload>,
+  ): Promise<void> {
+    for (const workspace of workspaces) {
+      const isGit = workspace.workspaceKind !== "directory";
+      const cwd = resolve(workspace.workspaceDirectory);
+      if (!isGit) {
+        syncObserver(cwd, { isGit, workspaceId: workspace.id });
+        rememberDescriptorState(workspace.id, workspace);
+        continue;
+      }
+
+      const existingSubscription = subscriptions.get(cwd);
+      if (existingSubscription && !existingSubscription.authority) removeForCwd(cwd);
+      const existing = subscriptions.get(cwd)?.authority;
+      if (existing) {
+        if (existing.workspaceId !== workspace.id || !(await existing.isCurrent())) {
+          removeForCwd(cwd);
+          throw new Error("workspace observer authority no longer matches the catalog");
+        }
+        syncObserver(cwd, { isGit, workspaceId: workspace.id });
+        rememberDescriptorState(workspace.id, workspace);
+        continue;
+      }
+
+      const authority = await openRestrictedAuthority(cwd);
+      if (authority.workspaceId !== workspace.id) {
+        await authority.release();
+        throw new Error("workspace observer authority does not match the catalog");
+      }
+      syncObserver(cwd, { isGit, workspaceId: workspace.id }, authority);
+      rememberDescriptorState(workspace.id, workspace);
+    }
+  }
+
   async function syncObserverForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void> {
     const descriptor = await describeWorkspaceRecordWithGitData(workspace);
     syncObservers([descriptor]);
@@ -213,6 +302,7 @@ export function createWorkspaceGitObserverService(deps: {
 
   return {
     syncObservers,
+    syncMayaRestrictedObservers,
     syncObserverForWorkspace,
 
     async warmGitData(workspace) {
@@ -257,10 +347,7 @@ export function createWorkspaceGitObserverService(deps: {
     removeForWorkspaceId,
 
     dispose() {
-      for (const unsubscribe of subscriptions.values()) {
-        unsubscribe();
-      }
-      subscriptions.clear();
+      for (const cwd of [...subscriptions.keys()]) removeForCwd(cwd);
       watchTargets.clear();
       workspaceStates.clear();
     },

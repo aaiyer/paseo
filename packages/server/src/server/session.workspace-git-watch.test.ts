@@ -1,4 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
+import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type pino from "pino";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
@@ -20,6 +22,7 @@ import {
 } from "./workspace-registry.js";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import type { WorkspaceGitObserverService } from "./session/workspace-git-observer/workspace-git-observer-service.js";
+import { deriveMayaRestrictedWorkspaceId } from "./maya-restricted-mode.js";
 
 interface SessionInternals {
   workspaceUpdatesSubscription: {
@@ -200,6 +203,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     agentManager: createStub<SessionOptions["agentManager"]>({
       subscribe: () => () => {},
       listAgents: () => [],
+      listProviderSubagentActivity: () => [],
       getAgent: () => null,
     }),
     agentStorage: createStub<SessionOptions["agentStorage"]>({
@@ -316,6 +320,51 @@ function seedGitWorkspace(input: {
 }
 
 describe("workspace git watch targets", () => {
+  test("restricted fetch observer emits nothing after a same-path replacement", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "maya-workspace-observer-"));
+    const cwd = path.join(root, "workspace");
+    const displaced = path.join(root, "displaced");
+    await mkdir(path.join(cwd, ".git"), { recursive: true });
+    const workspaceId = await deriveMayaRestrictedWorkspaceId(cwd);
+    const { session, emitted, projects, workspaces, workspaceGitService, subscriptions } =
+      createSessionForWorkspaceGitWatchTests();
+    seedGitWorkspace({
+      projects,
+      workspaces,
+      projectId: "proj-restricted",
+      workspaceId,
+      cwd,
+      name: "main",
+    });
+
+    try {
+      await session.handleMessage(
+        {
+          type: "fetch_workspaces_request",
+          requestId: "restricted-fetch",
+          subscribe: { subscriptionId: "restricted-observer" },
+        },
+        undefined,
+        null,
+        true,
+      );
+      expect(subscriptions).toHaveLength(1);
+      const peekCallsBeforeReplacement = workspaceGitService.peekSnapshot.mock.calls.length;
+      emitted.length = 0;
+
+      await rename(cwd, displaced);
+      await mkdir(path.join(cwd, ".git"), { recursive: true });
+      subscriptions[0]?.listener(createWorkspaceRuntimeSnapshot(cwd));
+
+      await vi.waitFor(() => expect(subscriptions[0]?.unsubscribe).toHaveBeenCalledTimes(1));
+      expect(workspaceGitService.peekSnapshot).toHaveBeenCalledTimes(peekCallsBeforeReplacement);
+      expect(emitted).toEqual([]);
+    } finally {
+      await session.cleanup();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("emits one workspace_update when the workspace git service emits a changed snapshot", async () => {
     const { session, emitted, projects, workspaces, workspaceGitService, subscriptions } =
       createSessionForWorkspaceGitWatchTests();

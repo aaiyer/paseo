@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import type pino from "pino";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { WorkspaceDescriptorPayload } from "../../messages.js";
 import type {
   WorkspaceGitListener,
@@ -8,6 +8,7 @@ import type {
   WorkspaceGitService,
 } from "../../workspace-git-service.js";
 import type { PersistedWorkspaceRecord } from "../../workspace-registry.js";
+import type { MayaRestrictedWorkspaceAuthority } from "../../maya-restricted-mode.js";
 import { createWorkspaceGitObserverService } from "./workspace-git-observer-service.js";
 
 // Watch targets are keyed by resolve(cwd), which is platform-dependent (POSIX vs Windows
@@ -54,7 +55,12 @@ function flushMicrotasks(): Promise<void> {
   return new Promise((done) => setImmediate(done));
 }
 
-function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
+function buildHarness(
+  opts: {
+    emitCwdRejects?: boolean;
+    restrictedAuthority?: MayaRestrictedWorkspaceAuthority;
+  } = {},
+) {
   const listeners = new Map<string, WorkspaceGitListener>();
   const registerCalls: string[] = [];
   const unsubscribeCalls: string[] = [];
@@ -104,6 +110,11 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
       branchChanges.push([workspaceId, oldBranch, newBranch]);
     },
     logger: { warn: (...args: unknown[]) => warnCalls.push(args) } as unknown as pino.Logger,
+    ...(opts.restrictedAuthority
+      ? {
+          openMayaRestrictedWorkspaceAuthority: async () => opts.restrictedAuthority!,
+        }
+      : {}),
   });
 
   function emitSnapshot(cwd: string, branch: string | null): void {
@@ -176,6 +187,26 @@ describe("syncObservers", () => {
     expect(h.registerCalls).toEqual([WS1]);
   });
 
+  test("replaces an ordinary observer with a catalog-bound restricted observer", async () => {
+    const authority: MayaRestrictedWorkspaceAuthority = {
+      cwd: WS1,
+      workspaceId: "ws1",
+      rootAccessPath: "/proc/self/fd/43",
+      retain() {
+        return this;
+      },
+      release: async () => {},
+      isCurrent: async () => true,
+    };
+    const h = buildHarness({ restrictedAuthority: authority });
+    const descriptor = makeDescriptor({ id: "ws1", workspaceDirectory: WS1 });
+    h.service.syncObservers([descriptor]);
+    await h.service.syncMayaRestrictedObservers([descriptor]);
+
+    expect(h.unsubscribeCalls).toEqual([WS1]);
+    expect(h.registerCalls).toEqual([WS1, WS1]);
+  });
+
   test("tears down the subscription when a git workspace becomes non-git", () => {
     const h = buildHarness();
     h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
@@ -239,6 +270,35 @@ describe("syncObservers", () => {
 });
 
 describe("git snapshot listener", () => {
+  test("cancels a restricted observer before replacement state can emit", async () => {
+    let current = true;
+    const release = vi.fn(async () => {});
+    const authority: MayaRestrictedWorkspaceAuthority = {
+      cwd: WS1,
+      workspaceId: "ws1",
+      rootAccessPath: "/proc/self/fd/41",
+      retain() {
+        return this;
+      },
+      release,
+      isCurrent: async () => current,
+    };
+    const h = buildHarness({ restrictedAuthority: authority });
+    await h.service.syncMayaRestrictedObservers([
+      makeDescriptor({ id: "ws1", workspaceDirectory: WS1 }),
+    ]);
+
+    current = false;
+    h.emitSnapshot(WS1, "replacement");
+    await flushMicrotasks();
+
+    expect(h.unsubscribeCalls).toEqual([WS1]);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(h.branchChanges).toEqual([]);
+    expect(h.emitCwdCalls).toEqual([]);
+    expect(h.statusCalls).toEqual([]);
+  });
+
   test("fans a snapshot out to branch-change, workspace-update, and status-update", async () => {
     const h = buildHarness();
     h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);

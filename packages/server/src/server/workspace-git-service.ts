@@ -371,6 +371,7 @@ interface WorkspaceGitServiceOptions {
   logger: pino.Logger;
   paseoHome: string;
   worktreesRoot?: string;
+  mayaRestrictedMode?: true;
   fileObserver?: FileObserver;
   deps?: Partial<WorkspaceGitServiceDependencies>;
 }
@@ -526,6 +527,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private readonly logger: pino.Logger;
   private readonly paseoHome: string;
   private readonly worktreesRoot: string | undefined;
+  private readonly mayaRestrictedMode: boolean;
   private readonly fileObserver: FileObserver;
   private readonly deps: WorkspaceGitServiceDependencies;
   private readonly forgeResolver: ForgeResolver;
@@ -581,6 +583,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.logger = options.logger.child({ module: "workspace-git-service" });
     this.paseoHome = options.paseoHome;
     this.worktreesRoot = options.worktreesRoot;
+    this.mayaRestrictedMode = options.mayaRestrictedMode === true;
     this.fileObserver = options.fileObserver ?? createFileObserver();
     this.deps = resolveWorkspaceGitServiceDeps(
       this.fileObserver.subscribe.bind(this.fileObserver),
@@ -744,9 +747,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     readOptions?: WorkspaceGitReadOptions,
   ): Promise<CheckoutDiffResult> {
     this.assertNotDisposed();
-    const normalizedCwd = resolve(cwd);
-    const cacheCwd =
-      resolveMayaRestrictedWorkspaceAuthorityBinding(normalizedCwd)?.cacheKey ?? normalizedCwd;
+    const { cwd: normalizedCwd, key: cacheCwd } = this.resolveWorkspaceTargetLocation(cwd);
     const normalizedOptions = this.normalizeCheckoutDiffOptions(options);
     const key = this.buildCheckoutDiffCacheKey(cacheCwd, normalizedOptions);
     return this.readAuxiliaryCache(this.checkoutDiffCache, key, readOptions, () =>
@@ -1018,9 +1019,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     key: string;
   } {
     const normalizedCwd = resolve(cwd);
+    const authority = resolveMayaRestrictedWorkspaceAuthorityBinding(normalizedCwd);
     return {
-      cwd: normalizedCwd,
-      key: resolveMayaRestrictedWorkspaceAuthorityBinding(normalizedCwd)?.cacheKey ?? normalizedCwd,
+      cwd: authority?.rootAccessPath ?? normalizedCwd,
+      key: authority?.cacheKey ?? normalizedCwd,
     };
   }
 
@@ -1807,6 +1809,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const existingTarget = this.repoTargets.get(repoGitRoot);
     if (existingTarget) {
       existingTarget.workspaceKeys.add(workspaceTarget.key);
+      if (this.repoTargetHasMayaAuthority(existingTarget)) {
+        this.disableRepoBackgroundFetch(existingTarget);
+      }
       return;
     }
 
@@ -1840,6 +1845,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (!fetchWorkspaceTarget) {
       return;
     }
+    if (this.repoTargetHasMayaAuthority(repoTarget)) {
+      return;
+    }
     repoTarget.cwd = fetchWorkspaceTarget.cwd;
     const facts = fetchWorkspaceTarget.latestFacts;
     const hasOrigin =
@@ -1847,6 +1855,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         ? facts.remoteUrl !== null
         : await this.deps.hasOriginRemote(fetchWorkspaceTarget.cwd);
     if (repoTarget.closed || this.repoTargets.get(repoGitRoot) !== repoTarget) {
+      return;
+    }
+    if (this.repoTargetHasMayaAuthority(repoTarget)) {
       return;
     }
     if (!hasOrigin) {
@@ -3149,7 +3160,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private async runRepoFetch(target: RepoGitTarget): Promise<void> {
-    if (target.fetchInFlight) {
+    if (target.fetchInFlight || this.repoTargetHasMayaAuthority(target)) {
       return;
     }
 
@@ -3236,6 +3247,22 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       });
     }
     this.scheduleRepoMetadataRefresh(target, "repo-fetch", false, refreshes);
+  }
+
+  private repoTargetHasMayaAuthority(target: RepoGitTarget): boolean {
+    if (this.mayaRestrictedMode) return true;
+    return [...target.workspaceKeys].some((key) => {
+      const workspaceTarget = this.workspaceTargets.get(key);
+      return (
+        workspaceTarget !== undefined &&
+        resolveMayaRestrictedWorkspaceAuthorityBinding(workspaceTarget.cwd) !== null
+      );
+    });
+  }
+
+  private disableRepoBackgroundFetch(target: RepoGitTarget): void {
+    if (target.intervalId) clearInterval(target.intervalId);
+    target.intervalId = null;
   }
 
   private flushBufferedFetchMetadataEvents(target: RepoGitTarget): void {

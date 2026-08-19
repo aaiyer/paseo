@@ -2361,7 +2361,7 @@ export class VoiceAssistantWebSocketServer {
 
     const startMs = performance.now();
     try {
-      await activeConnection.session.handleMessage(message.message, ws, workspaceAuthority);
+      await activeConnection.session.handleMessage(message.message, ws, workspaceAuthority, true);
     } finally {
       await workspaceAuthority?.release();
     }

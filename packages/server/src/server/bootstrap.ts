@@ -866,6 +866,7 @@ export async function createPaseoDaemon(
     logger,
     paseoHome: config.paseoHome,
     worktreesRoot: config.worktreesRoot,
+    mayaRestrictedMode: true,
     deps: {
       forgeOverrides: { github },
     },

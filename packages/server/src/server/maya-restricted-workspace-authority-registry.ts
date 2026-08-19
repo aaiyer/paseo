@@ -8,32 +8,35 @@ export interface MayaRestrictedGitLaunchContext {
 
 export interface MayaRestrictedWorkspaceAuthorityBinding {
   readonly cacheKey: string;
+  readonly cwd: string;
+  readonly rootAccessPath: string;
   readonly gitLaunchContext: MayaRestrictedGitLaunchContext | null;
   validateGitAssociation(): Promise<void>;
 }
 
-const bindings = new Map<string, MayaRestrictedWorkspaceAuthorityBinding>();
+const bindingsByPath = new Map<string, MayaRestrictedWorkspaceAuthorityBinding>();
 const releaseListeners = new Set<(cacheKey: string) => void>();
 
 export function registerMayaRestrictedWorkspaceAuthorityBinding(
-  accessPath: string,
   binding: MayaRestrictedWorkspaceAuthorityBinding,
 ): () => void {
-  if (bindings.has(accessPath)) {
-    throw new Error("workspace authority access path is already registered");
+  if (bindingsByPath.has(binding.cwd) || bindingsByPath.has(binding.rootAccessPath)) {
+    throw new Error("workspace authority path is already registered");
   }
-  bindings.set(accessPath, binding);
+  bindingsByPath.set(binding.cwd, binding);
+  bindingsByPath.set(binding.rootAccessPath, binding);
   return () => {
-    if (bindings.get(accessPath) !== binding) return;
-    bindings.delete(accessPath);
+    if (bindingsByPath.get(binding.rootAccessPath) !== binding) return;
+    bindingsByPath.delete(binding.cwd);
+    bindingsByPath.delete(binding.rootAccessPath);
     for (const listener of releaseListeners) listener(binding.cacheKey);
   };
 }
 
 export function resolveMayaRestrictedWorkspaceAuthorityBinding(
-  accessPath: string,
+  path: string,
 ): MayaRestrictedWorkspaceAuthorityBinding | null {
-  return bindings.get(accessPath) ?? null;
+  return bindingsByPath.get(path) ?? null;
 }
 
 export function onMayaRestrictedWorkspaceAuthorityReleased(

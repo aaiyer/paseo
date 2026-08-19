@@ -249,11 +249,13 @@ function createGitHubServiceStub(): ForgeService {
 }
 
 interface CreateServiceTestOptions {
+  mayaRestrictedMode?: true;
   subscribe?: ReturnType<typeof vi.fn>;
   getCheckoutStatus?: ReturnType<typeof vi.fn>;
   getCheckoutSnapshotFacts?: ReturnType<typeof vi.fn>;
   getCheckoutShortstat?: ReturnType<typeof vi.fn>;
   getCheckoutWorktreeState?: ReturnType<typeof vi.fn>;
+  getCheckoutDiff?: ReturnType<typeof vi.fn>;
   getPullRequestStatus?: ReturnType<typeof vi.fn>;
   github?: ForgeService;
   resolveAbsoluteGitDir?: ReturnType<typeof vi.fn>;
@@ -304,7 +306,8 @@ function buildDefaultTestServiceDeps() {
 }
 
 function createService(options?: CreateServiceTestOptions) {
-  const deps = { ...buildDefaultTestServiceDeps(), ...options };
+  const { mayaRestrictedMode, ...dependencyOptions } = options ?? {};
+  const deps = { ...buildDefaultTestServiceDeps(), ...dependencyOptions };
   deps.getCheckoutWorktreeState =
     options?.getCheckoutWorktreeState ??
     vi.fn(async (cwd: string) => {
@@ -320,6 +323,7 @@ function createService(options?: CreateServiceTestOptions) {
   return new WorkspaceGitServiceImpl({
     logger: createLogger() as unknown as pino.Logger,
     paseoHome: "/tmp/paseo-test",
+    ...(mayaRestrictedMode ? { mayaRestrictedMode } : {}),
     deps,
   });
 }
@@ -349,13 +353,12 @@ describe("WorkspaceGitServiceImpl", () => {
     });
     const binding = (cacheKey: string) => ({
       cacheKey,
+      cwd: reusedFdPath,
+      rootAccessPath: reusedFdPath,
       gitLaunchContext: null,
       validateGitAssociation: async () => undefined,
     });
-    const unregisterA = registerMayaRestrictedWorkspaceAuthorityBinding(
-      reusedFdPath,
-      binding("authority-a"),
-    );
+    const unregisterA = registerMayaRestrictedWorkspaceAuthorityBinding(binding("authority-a"));
 
     try {
       const listener = vi.fn();
@@ -369,10 +372,7 @@ describe("WorkspaceGitServiceImpl", () => {
       unregisterA();
 
       selectedBranch = "workspace-b";
-      const unregisterB = registerMayaRestrictedWorkspaceAuthorityBinding(
-        reusedFdPath,
-        binding("authority-b"),
-      );
+      const unregisterB = registerMayaRestrictedWorkspaceAuthorityBinding(binding("authority-b"));
       try {
         const secondSubscription = service.registerWorkspace({ cwd: reusedFdPath }, vi.fn());
         const second = await service.getSnapshot(reusedFdPath);
@@ -385,6 +385,48 @@ describe("WorkspaceGitServiceImpl", () => {
       }
     } finally {
       unregisterA();
+      await service.dispose();
+    }
+  });
+
+  test("never background-fetches for authority-bound workspace and diff reads", async () => {
+    const accessPath = path.resolve("/proc/self/fd/77");
+    const runGitFetch = vi.fn(async () => ({ changes: [], error: null }));
+    const getCheckoutDiff = vi.fn(async () => ({ files: [], truncated: false }));
+    const service = createService({
+      mayaRestrictedMode: true,
+      getCheckoutSnapshotFacts: vi.fn(async () => createCheckoutSnapshotFacts(accessPath)),
+      getCheckoutStatus: vi.fn(async () => createCheckoutStatus(accessPath)),
+      getCheckoutDiff,
+      hasOriginRemote: vi.fn(async () => true),
+      runGitFetch,
+    });
+    const unregister = registerMayaRestrictedWorkspaceAuthorityBinding({
+      cacheKey: "restricted-no-fetch",
+      cwd: REPO_CWD,
+      rootAccessPath: accessPath,
+      gitLaunchContext: null,
+      validateGitAssociation: async () => undefined,
+    });
+
+    try {
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await service.getSnapshot(REPO_CWD, { force: true, reason: "restricted-workspace-read" });
+      await service.getCheckoutDiff(REPO_CWD, { mode: "uncommitted" });
+      await service.refresh(REPO_CWD);
+      await flushPromises();
+      await vi.advanceTimersByTimeAsync(3 * 60_000 * 2);
+      await flushPromises();
+
+      expect(getCheckoutDiff).toHaveBeenCalledWith(
+        accessPath,
+        { mode: "uncommitted" },
+        expect.any(Object),
+      );
+      expect(runGitFetch).not.toHaveBeenCalled();
+      subscription.unsubscribe();
+    } finally {
+      unregister();
       await service.dispose();
     }
   });
